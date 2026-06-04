@@ -1,6 +1,6 @@
 import os
 from aiogram import Router, F, Bot
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, ChatMemberUpdated
+from aiogram.types import Message, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, ChatMemberUpdated
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
@@ -37,18 +37,14 @@ async def check_user_and_format_response(username: str) -> str:
     total_negative = user["clown_count"] + user["suspect_count"]
     total_votes = total_negative + user["good_count"]
     
-    # Расчет вероятности скама
     scam_percentage = 0
     if total_votes > 0:
-        # Клоун весит 100% негатива, Подозрение 50%
         scam_weight = (user["clown_count"] * 100) + (user["suspect_count"] * 50)
         scam_percentage = min(100, int(scam_weight / total_votes))
         
-    # Корректируем если железно есть пруфы скама
     if user["has_proof"]:
         scam_percentage = max(scam_percentage, 95)
         
-    # Определяем титул сообщения
     if user["has_proof"] or user["clown_count"] > 0 or user["suspect_count"] > 0:
         title = "[ВОЗМОЖЕН СКАМ!]"
     else:
@@ -67,9 +63,9 @@ async def check_user_and_format_response(username: str) -> str:
         f"Наличие прямых доказательств (пруфов): {proof_status}"
     )
 
-# --- РАБОТА В ГРУППАХ И ЛС (ТОЛЬКО ПРОВЕРКА) ---
-@router.message(F.text.lower.contains("скам"))
-async def process_scam_check(message: Message):
+# --- РАБОТА В ГРУППАХ (РАБОТАЕТ ДАЖЕ ЕСЛИ ПИШУТ ОТ ИМЕНИ ГРУППЫ) ---
+@router.message(F.chat.type.in_({"group", "supergroup"}), F.text.lower.contains("скам"))
+async def process_scam_check_group(message: Message):
     text_parts = message.text.split()
     target_user = None
     
@@ -79,9 +75,9 @@ async def process_scam_check(message: Message):
             break
             
     if not target_user and message.reply_to_message:
-        if message.reply_to_message.from_user.username:
+        if message.reply_to_message.from_user and message.reply_to_message.from_user.username:
             target_user = f"@{message.reply_to_message.from_user.username}"
-        else:
+        elif message.reply_to_message.from_user:
             target_user = message.reply_to_message.from_user.full_name
 
     if not target_user:
@@ -89,6 +85,11 @@ async def process_scam_check(message: Message):
 
     response_text = await check_user_and_format_response(target_user)
     await message.reply(response_text)
+
+# Обработка /start в группах (чтобы бот не падал и просто отвечал)
+@router.message(F.chat.type.in_({"group", "supergroup"}), Command("start"))
+async def cmd_start_group(message: Message):
+    await message.reply("Я работаю в этом чате! Чтобы проверить пользователя, напишите: `скам @username`")
 
 # --- ПРИВЕТСТВИЕ ПРИ ДОБАВЛЕНИИ В ЧАТ ---
 @router.my_chat_member()
@@ -101,25 +102,34 @@ async def bot_added_to_chat(event: ChatMemberUpdated):
             text=f"Привет, чат «{event.chat.title}»! Я бот-антискам. 🛡\nЧтобы быстро проверить любого юзера, напишите: `скам @username` или ответьте словом `скам` на его сообщение."
         )
 
-# --- ГЛАВНОЕ МЕНЮ В ЛИЧКЕ (КНОПКИ СТАРТА) ---
+# --- ГЛАВНОЕ МЕНЮ В ЛИЧКЕ (НАСТОЯЩИЕ МЕНЮ КНОПКИ) ---
 @router.message(Command("start"), F.chat.type == "private")
 async def cmd_start_private(message: Message):
-    buttons = [
-        [InlineKeyboardButton(text="Сообщить о пользователе", callback_data="user_report_start")]
+    # Создаем меню-кнопки для нижней панели клавиатуры
+    keyboard_buttons = [
+        [KeyboardButton(text="🚨 Сообщить о пользователе")]
     ]
-    # Если зашел админ, добавляем кнопку модерации
+    
+    # Если пишет админ, добавляем ему кнопку управления в меню
     if message.from_user.id == ADMIN_ID:
-        buttons.append([InlineKeyboardButton(text="Заявки (Админ)", callback_data="admin_view_now")])
+        keyboard_buttons.append([KeyboardButton(text="⚙️ Панель Модератора")])
         
-    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
-    await message.answer("Добро пожаловать в главное меню бота Анти-Скам!", reply_markup=kb)
+    main_menu_keyboard = ReplyKeyboardMarkup(
+        keyboard=keyboard_buttons,
+        resize_keyboard=True, # Делает кнопки аккуратными по размеру, а не огромными
+        one_time_keyboard=False
+    )
+    
+    await message.answer(
+        "Добро пожаловать в главное меню бота Анти-Скам!\nИспользуйте кнопки меню ниже для взаимодействия.",
+        reply_markup=main_menu_keyboard
+    )
 
-# Начало процесса подачи жалобы
-@router.callback_query(F.data == "user_report_start")
-async def report_username_step(callback: CallbackQuery, state: FSMContext):
-    await callback.message.edit_text("Введите @username пользователя, на которого хотите отправить жалобу/рейтинг:")
+# Обработка нажатия текстовой кнопки "🚨 Сообщить о пользователе"
+@router.message(F.text == "🚨 Сообщить о пользователе", F.chat.type == "private")
+async def report_username_step(message: Message, state: FSMContext):
+    await message.answer("Введите @username пользователя, на которого хотите отправить жалобу/рейтинг:")
     await state.set_state(ReportStates.waiting_for_username)
-    await callback.answer()
 
 @router.message(ReportStates.waiting_for_username, F.chat.type == "private")
 async def save_reported_username(message: Message, state: FSMContext):
@@ -129,6 +139,7 @@ async def save_reported_username(message: Message, state: FSMContext):
         
     await state.update_data(target_user=message.text)
     
+    # Здесь по ТЗ бот выдает инлайн-вопрос с выбором формата отправки
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Реакцией", callback_data="report_by_rating"),
          InlineKeyboardButton(text="Пруфом", callback_data="report_by_proof")]
@@ -221,17 +232,29 @@ async def notify_admin_new_request(bot: Bot, name: str):
         ADMIN_ID, f"{name}, тут есть запросы на внесение данных в скам базу\nхочешь посмотреть или позже?", reply_markup=kb
     )
 
-# --- АДМИНКА ---
+# --- АДМИНКА (КНОПКА ИЗ МЕНЮ-КЛАВИАТУРЫ) ---
+@router.message(F.text == "⚙️ Панель Модератора", F.chat.type == "private")
+async def admin_menu_text_btn(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Посмотреть активные заявки 📊", callback_data="admin_view_now")]
+    ])
+    await message.answer("Вы вошли в панель управления модерацией заявок:", reply_markup=kb)
+
 @router.callback_query(F.data == "admin_view_later")
 async def view_later(callback: CallbackQuery):
-    await callback.message.edit_text("Понял, заявки можно посмотреть в любое время через Главное меню кнопкой «Заявки»")
+    await callback.message.edit_text("Понял, заявки можно посмотреть в любое время через меню клавиатуры кнопкой «⚙️ Панель Модератора»")
     await callback.answer()
 
 @router.callback_query(F.data == "admin_view_now")
 async def show_moderation_queue(callback: CallbackQuery):
     requests = await get_pending_requests()
     if not requests:
-        await callback.message.edit_text("Все заявки разобраны!")
+        if callback.message.text:
+            await callback.message.edit_text("Все заявки разобраны!")
+        else:
+            await callback.message.answer("Все заявки разобраны!")
         await callback.answer()
         return
     
@@ -249,7 +272,10 @@ async def show_moderation_queue(callback: CallbackQuery):
         await callback.message.delete()
         await callback.message.answer_photo(photo=req['media_file_id'], caption=text, reply_markup=kb)
     else:
-        await callback.message.edit_text(text, reply_markup=kb)
+        if callback.message.text:
+            await callback.message.edit_text(text, reply_markup=kb)
+        else:
+            await callback.message.answer(text, reply_markup=kb)
     await callback.answer()
 
 @router.callback_query(F.data.startswith("approve_") | F.data.startswith("reject_"))
