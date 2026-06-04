@@ -1,0 +1,42 @@
+name: Eternal Telegram Bot
+
+on:
+  push:
+    branches: [ main, master ]
+  schedule:
+    # Запуск строго каждые 3 часа (в 00:00, 03:00, 06:00, 09:00, 12:00, 15:00, 18:00, 21:00 по UTC)
+    - cron: '0 */3 * * *'
+  workflow_dispatch: # Позволяет запускать вручную из панели GitHub
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+
+    - name: Install dependencies
+      run: |
+        pip install -r requirements.txt
+
+    - name: Run Telegram Bot with Timeout
+      env:
+        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+        SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      run: |
+        echo "Запуск бота. Процесс завершится автоматически через 2 часа 55 минут для перезапуска..."
+        
+        # 3 часа — это 10800 секунд. 
+        # Ставим таймаут 10500 секунд (2 часа 55 минут).
+        # Оставляем 5 минут запаса, чтобы воркфлоу успел корректно закрыться до того, как крон запустит новый.
+        
+        timeout 10500s python bot.py || true
+        
+        echo "Время круга истекло. Воркфлоу завершен, ожидаем перезапуск от cron..."
