@@ -34,21 +34,31 @@ class CheckStates(StatesGroup):
 
 
 # =====================================================================
-# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ И РЕЗОЛВ ID
 # =====================================================================
 
 async def resolve_user_data(bot: Bot, raw_input: str):
-    """Преобразует ввод пользователя в Telegram ID и юзернейм через get_chat"""
+    """
+    Преобразует ввод пользователя в Telegram ID и юзернейм.
+    Пытается превратить юзернейм в ID железно через API Telegram.
+    """
     raw_input = raw_input.strip()
+    
+    # Если ввели чистый ID (цифры)
     if raw_input.isdigit():
         return int(raw_input), None
     
+    # Если ввели юзернейм
     cleaned = raw_input.replace("@", "").strip()
+    
     try:
+        # Пытаемся получить объект чата/юзера из Telegram API
         chat = await bot.get_chat(f"@{cleaned}")
         return chat.id, chat.username or cleaned
     except Exception as e:
-        logger.error(f"Ошибка резолва пользователя через API Telegram ({raw_input}): {e}")
+        # Если бот не общался с юзером, Telegram может выдать "chat not found".
+        # В таком случае ID вернуть не получится, пишем None, но сохраняем юзернейм.
+        logger.warning(f"Не удалось получить ID для @{cleaned} через API: {e}")
         return None, cleaned
 
 
@@ -103,10 +113,9 @@ async def cmd_start(message: Message, state: FSMContext):
     await message.answer(welcome_text, reply_markup=main_kb, parse_mode="Markdown")
 
 
-# Перехват кликов по меню во время любых активных стейтов (анти-баг)
 @router.message(F.text.in_({"🔍 Проверить пользователя", "🚨 Сообщить о пользователе", "⚙️ Панель Модератора"}))
 async def cancel_state_on_menu_click(message: Message, state: FSMContext, bot: Bot):
-    """Если юзер находится внутри сценария FSM, но нажал кнопку меню — сбрасываем сценарий"""
+    """Сброс сценария при клике на кнопки меню"""
     await state.clear()
     if message.text == "🔍 Проверить пользователя":
         await ask_user_to_check(message, state)
@@ -117,32 +126,40 @@ async def cancel_state_on_menu_click(message: Message, state: FSMContext, bot: B
 
 
 # =====================================================================
-# БЛОК: ПРОВЕРКА ПОЛЬЗОВАТЕЛЯ
+# БЛОК: ПРОВЕРКА ПОЛЬЗОВАТЕЛЯ (УМНЫЙ ПОИСК С КОНВЕРТАЦИЕЙ В ID)
 # =====================================================================
 
 @router.message(F.text == "🔍 Проверить пользователя")
 async def ask_user_to_check(message: Message, state: FSMContext):
-    """Инициализация сценария проверки"""
     await state.set_state(CheckStates.waiting_for_input)
-    await message.answer("Введите @username пользователя или его цифровой Telegram ID, которого вы хотите проверить:")
+    await message.answer("Введите @username пользователя или его цифровой Telegram ID для проверки:")
 
 
 @router.message(CheckStates.waiting_for_input, F.chat.type == "private")
 async def check_user_in_db(message: Message, state: FSMContext, bot: Bot):
-    """Получение данных и запрос к Supabase для проверки скамера"""
     raw_input = message.text.strip()
     await state.clear()
     
+    # Конвертируем ввод в ID и юзернейм через API Telegram
     user_id, username = await resolve_user_data(bot, raw_input)
     
-    # Запрос в БД
-    scammer = await get_user_by_id_or_username(user_id=user_id, username=username or raw_input)
+    search_id = user_id if user_id else (int(raw_input) if raw_input.isdigit() else 0)
+    search_username = username if username else raw_input.replace("@", "").strip()
+
+    # Запрашиваем базу по обоим параметрам сразу
+    scammer = await get_user_by_id_or_username(user_id=search_id, username=search_username)
     
     if scammer:
+        # Формируем красивый вывод: Юзернейм (ID)
+        db_username = scammer.get('current_username', 'Не указан')
+        db_id = scammer.get('user_id')
+        
+        id_display = f"`{db_id}`" if db_id and db_id != 0 else "Скрыт/Не найден"
+        
         text = (
             f"🚨 *[ВНИМАНИЕ! ПОЛЬЗОВАТЕЛЬ НАЙДЕН В БАЗЕ]* 🚨\n\n"
-            f"👤 *Юзернейм:* @{scammer.get('current_username', 'Не указан')}\n"
-            f"🆔 *Telegram ID:* `{scammer.get('user_id', 'Скрыт')}`\n\n"
+            f"👤 *Юзернейм:* @{db_username}\n"
+            f"🆔 *Telegram ID:* {id_display}\n\n"
             f"📊 *Текущий рейтинг жалоб:*\n"
             f"🤡 Клоун: {scammer.get('clown_count', 0)}\n"
             f"🤔 Подозреваемый: {scammer.get('suspect_count', 0)}\n"
@@ -152,30 +169,31 @@ async def check_user_in_db(message: Message, state: FSMContext, bot: Bot):
             text += f"\n📄 *Подтвержденный пруф от админа:*\n_{scammer.get('proof_text', 'Без описания')}_"
         await message.answer(text, parse_mode="Markdown")
     else:
-        display_name = f"@{username}" if username else raw_input
+        display_name = f"@{search_username}" if search_username else raw_input
         await message.answer(f"*[ОТСУТСТВУЕТ В БАЗЕ]*\n\nПользователь {display_name} не найден в базе данных Анти-Скам.", parse_mode="Markdown")
 
 
 # =====================================================================
-# БЛОК: СОЗДАНИЕ ЖАЛОБЫ (ПОДАЧА ЗАЯВКИ НА МОДЕРАЦИЮ)
+# БЛОК: СОЗДАНИЕ ЖАЛОБЫ (ФИКСАЦИЯ TARGET_USER_ID)
 # =====================================================================
 
 @router.message(F.text == "🚨 Сообщить о пользователе")
 async def start_report(message: Message, state: FSMContext):
-    """Инициализация сценария подачи жалобы"""
     await state.set_state(ReportStates.waiting_for_username)
     await message.answer("Введите @username пользователя (или его ID), на которого хотите отправить жалобу:")
 
 
 @router.message(ReportStates.waiting_for_username, F.chat.type == "private")
 async def save_reported_username(message: Message, state: FSMContext, bot: Bot):
-    """Сохранение имени цели и вывод инлайн-клавиатуры типов жалоб"""
     raw_input = message.text.strip()
+    
+    # Железно вытаскиваем ID через API, чтобы зафиксировать скамера
     user_id, cleaned_name = await resolve_user_data(bot, raw_input)
     
-    db_username = (cleaned_name or raw_input).replace("@", "").lower().strip()
-    display_name = f"@{db_username}"
+    db_username = (cleaned_name or raw_input).replace("@", "").strip()
+    display_id = f" (ID: `{user_id}`)" if user_id else " (ID не найден через API)"
     
+    # Сохраняем и юзернейм, и полученный ID в кэш состояния
     await state.update_data(target_user_str=db_username, target_user_id=user_id)
     
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -186,12 +204,11 @@ async def save_reported_username(message: Message, state: FSMContext, bot: Bot):
         ],
         [InlineKeyboardButton(text="📄 Железный Пруф", callback_data="set_type:proof")]
     ])
-    await message.answer(f"Объект модерации определен как: {display_name}\nВыбери тип рейтинга или жалобы:", reply_markup=kb)
+    await message.answer(f"Объект модерации: @{db_username}{display_id}\nВыбери тип рейтинга или жалобы:", reply_markup=kb, parse_mode="Markdown")
 
 
 @router.callback_query(F.data.startswith("set_type:"))
 async def set_report_type(callback: CallbackQuery, state: FSMContext):
-    """Выбор типа и переход к описанию причины"""
     req_type = callback.data.split(":")[1]
     await state.update_data(req_type=req_type)
     
@@ -203,7 +220,6 @@ async def set_report_type(callback: CallbackQuery, state: FSMContext):
 
 @router.message(ReportStates.waiting_for_reason, F.chat.type == "private")
 async def process_rating_reason(message: Message, state: FSMContext, bot: Bot):
-    """Финальный этап создания заявки и отправка ее в Supabase"""
     if not is_valid_text(message.text):
         await message.answer("Описание причины слишком короткое. Распишите подробнее, пожалуйста:")
         return
@@ -211,32 +227,33 @@ async def process_rating_reason(message: Message, state: FSMContext, bot: Bot):
     data = await state.get_data()
     await state.clear()
     
+    # Теперь мы ПЕРЕДАЕМ target_user_id в твою обновленную таблицу!
+    t_id = data.get("target_user_id") if data.get("target_user_id") is not None else 0
+    
     try:
         await create_moderation_request(
             chat_id=message.chat.id, 
             target_user=data["target_user_str"],
-            target_user_id=data.get("target_user_id"), 
+            target_user_id=t_id,  # Колонка теперь создана в БД!
             reporter_id=message.from_user.id, 
-            reporter_name=message.from_user.full_name,
+            reporter_name=message.from_user.full_name or "Пользователь",
             req_type=data["req_type"], 
             reason=message.text
         )
         await message.answer("✅ Ваша заявка успешно создана и отправлена команде модерации. Спасибо за бдительность!")
-        # Сигнализируем админу
-        await notify_admin_new_request(bot, message.from_user.full_name)
+        await notify_admin_new_request(bot, message.from_user.full_name or "Пользователь")
     except Exception as db_err:
         logger.error(f"Ошибка сохранения заявки в Supabase: {db_err}")
-        await message.answer("❌ Произошла внутренняя ошибка при сохранении заявки в базу данных.")
+        await message.answer(f"❌ Ошибка бэкенда при создании заявки: {str(db_err)}")
 
 
 # =====================================================================
-# БЛОК: АДМИН-ПАНЕЛЬ И ОБРАБОТКА ОДОБРЕНИЯ / ОТКЛОНЕНИЯ
+# БЛОК: АДМИН-ПАНЕЛЬ
 # =====================================================================
 
 @router.message(F.text == "⚙️ Панель Модератора")
 @router.callback_query(F.data == "admin_view_now")
 async def admin_view_requests(event):
-    """Отображение очереди заявок на модерацию (Доступ только для ADMIN_ID)"""
     user_id = event.from_user.id
     if user_id != ADMIN_ID:
         if isinstance(event, CallbackQuery):
@@ -248,7 +265,6 @@ async def admin_view_requests(event):
     is_callback = isinstance(event, CallbackQuery)
     message = event.message if is_callback else event
 
-    # Берем заявки 'pending'
     requests = await get_pending_requests()
     if not requests:
         if is_callback:
@@ -269,9 +285,12 @@ async def admin_view_requests(event):
     }
     human_type = types_map.get(req['req_type'], req['req_type'])
 
+    display_target_id = req.get('target_user_id')
+    id_text = f"`{display_target_id}`" if display_target_id and display_target_id != 0 else "Не найден"
+
     text = (
         f"📋 *Новая заявка на модерацию #{req_id}*\n\n"
-        f"👤 *На кого жалоба:* @{req['target_username']} (ID: {req.get('target_user_id') or 'Не определен'})\n"
+        f"👤 *На кого жалоба:* @{req['target_username']} (ID: {id_text})\n"
         f"🏷️ *Тип действия:* {human_type}\n"
         f"📝 *Отправитель:* {req['reporter_name']} (ID: {req['reporter_id']})\n"
         f"💬 *Описание/Пруфы:* {req['reason']}"
@@ -293,7 +312,6 @@ async def admin_view_requests(event):
 
 @router.callback_query(F.data.startswith("approve_") | F.data.startswith("reject_"))
 async def handle_decision(callback: CallbackQuery):
-    """Обработчик решений админа (Принять/Отклонить заявку)"""
     if callback.from_user.id != ADMIN_ID:
         await callback.answer("Куда лезешь? Ты не админ!", show_alert=True)
         return
@@ -301,36 +319,33 @@ async def handle_decision(callback: CallbackQuery):
     action, req_id = callback.data.split("_")
     req_id = int(req_id)
     
-    # Берем данные текущей заявки, пока она в статусе pending
     requests = await get_pending_requests()
     current_req = next((r for r in requests if r['id'] == req_id), None)
     
     if action == "approve":
         if current_req:
             is_proof = current_req['req_type'] == "proof"
+            scam_id = current_req.get('target_user_id') if current_req.get('target_user_id') is not None else 0
             
             try:
-                # 1. Запись скамера в БД
+                # Вносим скамера железно по его ID в основную базу скамеров
                 await add_or_update_scammer_by_id(
-                    user_id=current_req.get('target_user_id'), 
+                    user_id=scam_id, 
                     username=current_req['target_username'],
                     req_type=current_req['req_type'], 
                     proof_text=current_req['reason'] if is_proof else None,
                     has_proof=is_proof
                 )
                 
-                # 2. Перевод статуса самой заявки в approved
                 await update_request_status(req_id, "approved")
-                msg_text = f"✅ Заявка #{req_id} одобрена. Данные внесены в базу Анти-Скам."
+                msg_text = f"✅ Заявка #{req_id} одобрена. Данные внесены по ID `{scam_id}` в базу."
                 
             except Exception as write_err:
                 logger.error(f"Ошибка при записи скамера в базу: {write_err}")
-                # Если упало — выводим ошибку на экран, чтобы понять причину сбоя Supabase
                 msg_text = f"❌ Ошибка Supabase при сохранении скамера: {str(write_err)}"
         else:
-            msg_text = "❌ Ошибка: не удалось выгрузить данные заявки из кэша до её утверждения."
+            msg_text = "❌ Ошибка: не удалось выгрузить данные заявки."
     else:
-        # При отклонении просто меняем статус в истории заявок
         try:
             await update_request_status(req_id, "rejected")
             msg_text = f"❌ Заявка #{req_id} успешно отклонена модератором."
@@ -338,9 +353,8 @@ async def handle_decision(callback: CallbackQuery):
             msg_text = f"❌ Ошибка изменения статуса заявки: {str(status_err)}"
         
     await callback.message.delete()
-    await callback.message.answer(msg_text)
+    await callback.message.answer(msg_text, parse_mode="Markdown")
     
-    # Проверяем, есть ли еще заявки
     next_requests = await get_pending_requests()
     if next_requests:
         kb = InlineKeyboardMarkup(inline_keyboard=[
