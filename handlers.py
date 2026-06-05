@@ -125,7 +125,7 @@ async def build_check_response(bot: Bot, search_id: int, search_username: str, t
     except Exception:
         proofs = []
     
-    # Расчет статуса
+    # Расчет статуса безопасности
     if proofs:
         status_header = "🔴 <b>КРИТИЧЕСКИЙ СТАТУС: СКАМЕР / МОШЕННИК</b> 🔴"
     elif scammer and (scammer.get("clown_count", 0) > 0 or scammer.get("suspect_count", 0) > 0):
@@ -156,16 +156,19 @@ async def build_check_response(bot: Bot, search_id: int, search_username: str, t
             text += f"🔘 <a href='{link}'>Скам {idx}</a>  "
         text += "\n"
 
-    kb = None
+    buttons = []
     if trigger_user_id != search_id:
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(text=f"🤡 Клоун ({clowns})", callback_data=f"vote:rating_clown:{search_username}:{search_id}"),
-                InlineKeyboardButton(text=f"🤔 Искомый ({suspects})", callback_data=f"vote:rating_suspect:{search_username}:{search_id}"),
-                InlineKeyboardButton(text=f"❤️ Гуд ({goods})", callback_data=f"vote:rating_good:{search_username}:{search_id}")
-            ]
+        buttons.append([
+            InlineKeyboardButton(text=f"🤡 Клоун ({clowns})", callback_data=f"vote:rating_clown:{search_username}:{search_id}"),
+            InlineKeyboardButton(text=f"🤔 Искомый ({suspects})", callback_data=f"vote:rating_suspect:{search_username}:{search_id}"),
+            InlineKeyboardButton(text=f"❤️ Гуд ({goods})", callback_data=f"vote:rating_good:{search_username}:{search_id}")
         ])
+    
+    # ЕСЛИ ПРОВЕРЯЕТ АДМИН: добавляем скрытую кнопку полной амнистии (удаления) прямо под карточку проверки
+    if await is_admin(trigger_user_id):
+        buttons.append([InlineKeyboardButton(text="🗑 Полный сброс (Амнистия)", callback_data=f"adm_delete_scam:{search_username}:{search_id}")])
         
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
     return text, kb
 
 # =====================================================================
@@ -191,8 +194,10 @@ async def group_check_handler(message: Message, bot: Bot):
     search_id = user_id if user_id else (int(target_input) if target_input.isdigit() else 0)
     search_username = username if username else target_input.replace("@", "").strip().lower()
 
-    text, _ = await build_check_response(bot, search_id, search_username, message.from_user.id)
-    await message.reply(text, parse_mode="HTML", disable_web_page_preview=True)
+    text, kb = await build_check_response(bot, search_id, search_username, message.from_user.id)
+    
+    # В группах для админов оставляем кнопку удаления, для обычных юзеров кнопок не будет
+    await message.reply(text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
 
 # =====================================================================
 # КОМАНДА START И ДИПЛИНКИ
@@ -262,18 +267,15 @@ async def perform_check(message: Message, state: FSMContext, bot: Bot):
     text, kb = await build_check_response(bot, search_id, search_username, message.from_user.id)
     kb_menu = await get_main_menu_kb(message.from_user.id)
     
-    if kb:
-        await message.answer(text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
-        # Отправляем меню кнопок отдельным невидимым пушем, чтобы клавиатура всегда была на экране
-        await message.answer("Результат проверки выведен выше.", reply_markup=kb_menu)
-    else:
-        await message.answer(text, parse_mode="HTML", reply_markup=kb_menu, disable_web_page_preview=True)
+    await message.answer(text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
+    await message.answer("Результат проверки выведен выше.", reply_markup=kb_menu)
 
 # =====================================================================
-# ДВИЖОК ПЕРЕЗАПИСЫВАЕМЫХ РЕАКЦИЙ С ОБНОВЛЕНИЕМ ТЕКСТА НА ХОДУ
+# ДВИЖОК ПЕРЕЗАПИСЫВАЕМЫХ РЕАКЦИЙ БЕЗ ДЮПА И НАКРУТОК
 # =====================================================================
 async def apply_user_reaction(reporter_id: int, target_username: str, target_id: int, new_reaction: str) -> str:
     try:
+        # Ищем, голосовал ли уже этот юзер за эту цель ранее
         query = supabase.table("user_reactions").select("id", "reaction_type").eq("reporter_id", reporter_id)
         if target_id and target_id != 0:
             query = query.eq("target_user_id", target_id)
@@ -282,24 +284,34 @@ async def apply_user_reaction(reporter_id: int, target_username: str, target_id:
         existing = query.execute()
         
         scammer = await get_user_by_id_or_username(user_id=target_id, username=target_username)
-        stats = {
-            "clown_count": scammer.get("clown_count", 0) if scammer else 0,
-            "suspect_count": scammer.get("suspect_count", 0) if scammer else 0,
-            "good_count": scammer.get("good_count", 0) if scammer else 0
-        }
         
+        # Загружаем текущие чистые счетчики из таблицы scammers (если записи нет — всё по нулям)
+        clowns = scammer.get("clown_count", 0) if scammer else 0
+        suspects = scammer.get("suspect_count", 0) if scammer else 0
+        goods = scammer.get("good_count", 0) if scammer else 0
+        
+        # Фикс дюпа: если старый голос найден
         if existing.data:
             old_rec = existing.data[0]
             old_type = old_rec["reaction_type"]
+            
             if old_type == new_reaction:
                 return "⚠️ Вы уже поставили эту реакцию!"
-            old_field = f"{old_type.replace('rating_', '')}_count"
-            stats[old_field] = max(0, stats[old_field] - 1)
+                
+            # Безопасно вычитаем старый голос
+            if "clown" in old_type: clowns = max(0, clowns - 1)
+            elif "suspect" in old_type: suspects = max(0, suspects - 1)
+            elif "good" in old_type: goods = max(0, goods - 1)
+            
+            # Удаляем прошлую запись лога из БД
             supabase.table("user_reactions").delete().eq("id", old_rec["id"]).execute()
 
-        new_field = f"{new_reaction.replace('rating_', '')}_count"
-        stats[new_field] += 1
+        # Прибавляем новый голос к соответствующей переменной
+        if "clown" in new_reaction: clowns += 1
+        elif "suspect" in new_reaction: suspects += 1
+        elif "good" in new_reaction: goods += 1
         
+        # Создаем новую запись в логах реакций
         supabase.table("user_reactions").insert({
             "reporter_id": reporter_id,
             "target_user_id": target_id,
@@ -307,9 +319,26 @@ async def apply_user_reaction(reporter_id: int, target_username: str, target_id:
             "reaction_type": new_reaction
         }).execute()
         
-        await add_or_update_scammer_by_id(user_id=target_id, username=target_username, req_type=new_reaction, proof_text=None, has_proof=False)
-        supabase.table("scammers").update({"clown_count": stats["clown_count"], "suspect_count": stats["suspect_count"], "good_count": stats["good_count"]}).eq("user_id", target_id if target_id != 0 else -1).execute()
-        return "✅ Реакция успешно учтена!"
+        # Синхронизируем итоговые агрегированные данные напрямую в таблицу scammers
+        target_uid_for_db = target_id if target_id != 0 else -1
+        
+        # Проверяем физическое существование строки в scammers
+        check_scam_row = supabase.table("scammers").select("user_id").eq("user_id", target_uid_for_db).execute()
+        
+        upd_payload = {
+            "clown_count": clowns,
+            "suspect_count": suspects,
+            "good_count": goods,
+            "username": target_username.lower()
+        }
+        
+        if check_scam_row.data:
+            supabase.table("scammers").update(upd_payload).eq("user_id", target_uid_for_db).execute()
+        else:
+            upd_payload["user_id"] = target_uid_for_db
+            supabase.table("scammers").insert(upd_payload).execute()
+            
+        return "✅ Реакция успешно обновлена!"
     except Exception as e:
         logger.error(f"Ошибка реакций: {e}")
         return "❌ Ошибка обновления базы."
@@ -323,20 +352,51 @@ async def process_vote_reaction(callback: CallbackQuery, bot: Bot):
         await callback.answer(TEXTS["self_report"], show_alert=True)
         return
         
-    # Применяем изменения в БД Supabase
     result_text = await apply_user_reaction(callback.from_user.id, t_username, t_id, reaction_type)
-    
-    # Генерируем абсолютно новый текст и кнопки на основе свежих данных
     new_text, new_kb = await build_check_response(bot, t_id, t_username, callback.from_user.id)
     
-    # Мгновенно обновляем интерфейс старого сообщения без создания новых сообщений
     try:
         await callback.message.edit_text(text=new_text, reply_markup=new_kb, parse_mode="HTML", disable_web_page_preview=True)
-    except Exception as e:
-        # Если текст сообщения не изменился (например кликнули на то же самое повторно) - пропускаем ошибку aiogram
+    except Exception:
         pass
         
     await callback.answer(result_text, show_alert=False)
+
+# =====================================================================
+# АДМИНСКИЙ ФУНКЦИОНАЛ: УДАЛЕНИЕ / АМНИСТИЯ ЗАПИСИ ИЗ БАЗЫ
+# =====================================================================
+@router.callback_query(F.data.startswith("adm_delete_scam:"))
+async def admin_delete_scam_profile(callback: CallbackQuery, bot: Bot):
+    if not await is_admin(callback.from_user.id):
+        await callback.answer("🔒 У вас нет прав на это действие.", show_alert=True)
+        return
+        
+    _, t_username, t_id = callback.data.split(":")
+    t_id = int(t_id)
+    
+    try:
+        # 1. Стираем все зафиксированные голоса/реакции юзеров против этой цели
+        supabase.table("user_reactions").delete().eq("target_username", t_username.lower()).execute()
+        if t_id and t_id != 0:
+            supabase.table("user_reactions").delete().eq("target_user_id", t_id).execute()
+            
+        # 2. Удаляем карту пользователя из основной таблицы scammers
+        supabase.table("scammers").delete().eq("username", t_username.lower()).execute()
+        if t_id and t_id != 0:
+            supabase.table("scammers").delete().eq("user_id", t_id).execute()
+            
+        # 3. Аннулируем все поданные или утвержденные жалобы с пруфами модерации
+        supabase.table("moderation_requests").delete().eq("target_username", t_username.lower()).execute()
+        
+        await callback.answer("🗑 Все данные пользователя, пруфы и реакции полностью стерты из системы!", show_alert=True)
+        
+        # Перерисовываем карточку (теперь она вернет статус "НАДЕЖНЫЙ ПОЛЬЗОВАТЕЛЬ" с нулями)
+        new_text, new_kb = await build_check_response(bot, t_id, t_username, callback.from_user.id)
+        await callback.message.edit_text(text=new_text, reply_markup=new_kb, parse_mode="HTML")
+        
+    except Exception as e:
+        logger.error(f"Ошибка удаления: {e}")
+        await callback.answer("❌ Ошибка выполнения процедуры удаления из базы Supabase.", show_alert=True)
 
 # =====================================================================
 # ПОДАЧА ЖАЛОБЫ С МЕДИАПРУФАМИ (ТОЛЬКО В ЛС)
@@ -427,7 +487,7 @@ async def process_proof_delivery(message: Message, state: FSMContext, bot: Bot):
         await message.answer(f"❌ Ошибка сохранения: {e}", reply_markup=kb_menu)
 
 # =====================================================================
-# АДМИН-ПАНЕЛЬ
+# АДМИН-ПАНЕЛЬ (МОДЕРАЦИЯ ОЧЕРЕДИ ЗАЯВЛЕНИЙ)
 # =====================================================================
 @router.message(Command("admin"), F.chat.type == "private")
 @router.message(F.text == "⚙️ Панель Модератора", F.chat.type == "private")
