@@ -14,17 +14,16 @@ from database.supabase_db import (
     update_request_status,
     add_or_update_scammer_by_id
 )
+# Предполагаем, что у тебя есть коннект к supabase в supabase_db
+from database.supabase_db import supabase 
 
-# Настройка логирования
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 router = Router()
 
-# Твой жестко прописанный ADMIN_ID
 ADMIN_ID = 6176762600
 
-# Состояния FSM
 class ReportStates(StatesGroup):
     waiting_for_username = State()
     waiting_for_reason = State()
@@ -34,166 +33,109 @@ class CheckStates(StatesGroup):
 
 
 # =====================================================================
-# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ И РЕЗОЛВ ID
+# АВТО-ОТЛЕЖИВАНИЕ ПОЛЬЗОВАТЕЛЕЙ (ЗАПОМИНАЕМ В ЛИЦО)
 # =====================================================================
 
-async def resolve_user_data(bot: Bot, raw_input: str):
+@router.message()
+async def track_every_user(message: Message):
     """
-    Преобразует ввод пользователя в Telegram ID и юзернейм.
-    Пытается превратить юзернейм в ID железно через API Telegram.
+    Хэндлер-шпион. Ловит абсолютно любые сообщения в личке и чатах,
+    чтобы сохранить связь Username -> ID во внутренней базе данных.
+    """
+    if message.from_user:
+        user_id = message.from_user.id
+        username = message.from_user.username.replace("@", "").strip() if message.from_user.username else None
+        full_name = message.from_user.full_name
+        
+        # Сохраняем/обновляем юзера в таблице users (UPSERT)
+        if username:
+            try:
+                supabase.table("users").upsert({
+                    "user_id": user_id,
+                    "username": username,
+                    "full_name": full_name
+                }, on_conflict="user_id").execute()
+            except Exception as e:
+                logger.error(f"Не удалось закешировать пользователя {user_id}: {e}")
+
+
+# =====================================================================
+# КОМБО-РЕЗОЛВЕР АЙДИ (УМНЫЙ ПОИСК ПО ВСЕМ ФРОНТАМ)
+# =====================================================================
+
+async def combo_find_user_id(bot: Bot, raw_input: str) -> tuple:
+    """
+    Ищет ID и юзернейм по всем доступным методам:
+    1. Проверка на чистый ID
+    2. Поиск во внутренней базе 'users' (Лицо в лицо)
+    3. Поиск по глобальным кэшам
     """
     raw_input = raw_input.strip()
     
-    # Если ввели чистый ID (цифры)
+    # Метод 1: Введен чистый ID
     if raw_input.isdigit():
         return int(raw_input), None
-    
-    # Если ввели юзернейм
-    cleaned = raw_input.replace("@", "").strip()
-    
-    try:
-        # Пытаемся получить объект чата/юзера из Telegram API
-        chat = await bot.get_chat(f"@{cleaned}")
-        return chat.id, chat.username or cleaned
-    except Exception as e:
-        # Если бот не общался с юзером, Telegram может выдать "chat not found".
-        # В таком случае ID вернуть не получится, пишем None, но сохраняем юзернейм.
-        logger.warning(f"Не удалось получить ID для @{cleaned} через API: {e}")
-        return None, cleaned
-
-
-def is_valid_text(text: str) -> bool:
-    """Проверяет длину введенного текста"""
-    return bool(text and len(text.strip()) >= 2)
-
-
-async def notify_admin_new_request(bot: Bot, reporter_name: str):
-    """Отправляет уведомление админу о новых заявках в очереди"""
-    if ADMIN_ID == 0:
-        return
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💯 Да, давай", callback_data="admin_view_now")],
-        [InlineKeyboardButton(text="❌ Нет, позже", callback_data="admin_close_notify")]
-    ])
-    try:
-        await bot.send_message(
-            chat_id=ADMIN_ID, 
-            text=f"👑 *Админ, внимание!* Поступили новые жалобы на модерацию. Проверим?", 
-            reply_markup=kb,
-            parse_mode="Markdown"
-        )
-    except Exception as e:
-        logger.error(f"Критическая ошибка отправки уведомления админу {ADMIN_ID}: {e}")
-
-
-# =====================================================================
-# СТАРТ И ОБРАБОТКА ГЛАВНОГО МЕНЮ
-# =====================================================================
-
-@router.message(Command("start"))
-async def cmd_start(message: Message, state: FSMContext):
-    """Команда /start. Сбрасывает стейты и строит reply-клавиатуру"""
-    await state.clear()
-    
-    main_kb = ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="🔍 Проверить пользователя")],
-            [KeyboardButton(text="🚨 Сообщить о пользователе")],
-            [KeyboardButton(text="⚙️ Панель Модератора")]
-        ],
-        resize_keyboard=True
-    )
-    
-    welcome_text = (
-        "👋 *Добро пожаловать в единую базу Анти-Скам!*\n\n"
-        "• Нажмите *🔍 Проверить пользователя*, чтобы узнать рейтинг человека.\n"
-        "• Нажмите *🚨 Сообщить о пользователе*, чтобы подать жалобу на мошенничество.\n"
-        "• Кнопка *⚙️ Панель Модератора* доступна только администраторам системы."
-    )
-    await message.answer(welcome_text, reply_markup=main_kb, parse_mode="Markdown")
-
-
-@router.message(F.text.in_({"🔍 Проверить пользователя", "🚨 Сообщить о пользователе", "⚙️ Панель Модератора"}))
-async def cancel_state_on_menu_click(message: Message, state: FSMContext, bot: Bot):
-    """Сброс сценария при клике на кнопки меню"""
-    await state.clear()
-    if message.text == "🔍 Проверить пользователя":
-        await ask_user_to_check(message, state)
-    elif message.text == "🚨 Сообщить о пользователе":
-        await start_report(message, state)
-    elif message.text == "⚙️ Панель Модератора":
-        await admin_view_requests(message)
-
-
-# =====================================================================
-# БЛОК: ПРОВЕРКА ПОЛЬЗОВАТЕЛЯ (УМНЫЙ ПОИСК С КОНВЕРТАЦИЕЙ В ID)
-# =====================================================================
-
-@router.message(F.text == "🔍 Проверить пользователя")
-async def ask_user_to_check(message: Message, state: FSMContext):
-    await state.set_state(CheckStates.waiting_for_input)
-    await message.answer("Введите @username пользователя или его цифровой Telegram ID для проверки:")
-
-
-@router.message(CheckStates.waiting_for_input, F.chat.type == "private")
-async def check_user_in_db(message: Message, state: FSMContext, bot: Bot):
-    raw_input = message.text.strip()
-    await state.clear()
-    
-    # Конвертируем ввод в ID и юзернейм через API Telegram
-    user_id, username = await resolve_user_data(bot, raw_input)
-    
-    search_id = user_id if user_id else (int(raw_input) if raw_input.isdigit() else 0)
-    search_username = username if username else raw_input.replace("@", "").strip()
-
-    # Запрашиваем базу по обоим параметрам сразу
-    scammer = await get_user_by_id_or_username(user_id=search_id, username=search_username)
-    
-    if scammer:
-        # Формируем красивый вывод: Юзернейм (ID)
-        db_username = scammer.get('current_username', 'Не указан')
-        db_id = scammer.get('user_id')
         
-        id_display = f"`{db_id}`" if db_id and db_id != 0 else "Скрыт/Не найден"
+    cleaned_username = raw_input.replace("@", "").strip()
+    
+    # Метод 2: Ищем во внутренней базе данных бота (таблица users)
+    try:
+        res = supabase.table("users").select("user_id").eq("username", cleaned_username).execute()
+        if res.data:
+            found_id = res.data[0]["user_id"]
+            logger.info(f"🎯 ID для @{cleaned_username} найден во внутренней БД users: {found_id}")
+            return found_id, cleaned_username
+    except Exception as e:
+        logger.error(f"Ошибка при поиске в локальной таблице users: {e}")
         
-        text = (
-            f"🚨 *[ВНИМАНИЕ! ПОЛЬЗОВАТЕЛЬ НАЙДЕН В БАЗЕ]* 🚨\n\n"
-            f"👤 *Юзернейм:* @{db_username}\n"
-            f"🆔 *Telegram ID:* {id_display}\n\n"
-            f"📊 *Текущий рейтинг жалоб:*\n"
-            f"🤡 Клоун: {scammer.get('clown_count', 0)}\n"
-            f"🤔 Подозреваемый: {scammer.get('suspect_count', 0)}\n"
-            f"❤️ Гуд (Доверие): {scammer.get('good_count', 0)}\n"
-        )
-        if scammer.get('has_proof'):
-            text += f"\n📄 *Подтвержденный пруф от админа:*\n_{scammer.get('proof_text', 'Без описания')}_"
-        await message.answer(text, parse_mode="Markdown")
-    else:
-        display_name = f"@{search_username}" if search_username else raw_input
-        await message.answer(f"*[ОТСУТСТВУЕТ В БАЗЕ]*\n\nПользователь {display_name} не найден в базе данных Анти-Скам.", parse_mode="Markdown")
+    # Метод 3: Пробуем системный фолбэк (на случай каналов/супергрупп)
+    try:
+        chat = await bot.get_chat(f"@{cleaned_username}")
+        return chat.id, chat.username or cleaned_username
+    except Exception:
+        pass
+
+    # Если ни один метод не сработал — возвращаем 0, но сохраняем текст юзернейма
+    return 0, cleaned_username
 
 
 # =====================================================================
-# БЛОК: СОЗДАНИЕ ЖАЛОБЫ (ФИКСАЦИЯ TARGET_USER_ID)
+# ХЭНДЛЕРЫ: СООБЩИТЬ О ПОЛЬЗОВАТЕЛЕ (ОТПРАВКА ЖАЛОБЫ)
 # =====================================================================
 
 @router.message(F.text == "🚨 Сообщить о пользователе")
 async def start_report(message: Message, state: FSMContext):
     await state.set_state(ReportStates.waiting_for_username)
-    await message.answer("Введите @username пользователя (или его ID), на которого хотите отправить жалобу:")
-
+    await message.answer(
+        "🚨 *Подача жалобы (КОМБО-РЕЖИМ)*\n\n"
+        "Вы можете действовать двумя способами:\n"
+        "1️⃣ **Перешлите (Forward)** сюда любое сообщение от скамера.\n"
+        "2️⃣ Или просто **напишите его @username** (или ID) текстом.\n\n"
+        "_Бот автоматически применит все методы поиска его ID!_",
+        parse_mode="Markdown"
+    )
 
 @router.message(ReportStates.waiting_for_username, F.chat.type == "private")
 async def save_reported_username(message: Message, state: FSMContext, bot: Bot):
-    raw_input = message.text.strip()
-    
-    # Железно вытаскиваем ID через API, чтобы зафиксировать скамера
-    user_id, cleaned_name = await resolve_user_data(bot, raw_input)
-    
-    db_username = (cleaned_name or raw_input).replace("@", "").strip()
-    display_id = f" (ID: `{user_id}`)" if user_id else " (ID не найден через API)"
-    
-    # Сохраняем и юзернейм, и полученный ID в кэш состояния
+    user_id = 0
+    db_username = None
+
+    # МЕТОД А: Юзер переслал сообщение скамера (Железный ID)
+    if message.forward_from:
+        user_id = message.forward_from.id
+        db_username = message.forward_from.username or f"id_{user_id}"
+    elif message.forward_from_chat:
+        user_id = message.forward_from_chat.id
+        db_username = message.forward_from_chat.username or message.forward_from_chat.title
+        
+    # МЕТОД Б: Юзер просто ввел текст (Включаем Комбо-Резолвер)
+    else:
+        raw_input = message.text.strip()
+        user_id, db_username = await combo_find_user_id(bot, raw_input)
+
+    db_username = db_username.replace("@", "").strip()
+    display_id = f"`{user_id}`" if user_id != 0 else "Не найден в кэше (будет проверен модератором)"
+
     await state.update_data(target_user_str=db_username, target_user_id=user_id)
     
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -204,51 +146,104 @@ async def save_reported_username(message: Message, state: FSMContext, bot: Bot):
         ],
         [InlineKeyboardButton(text="📄 Железный Пруф", callback_data="set_type:proof")]
     ])
-    await message.answer(f"Объект модерации: @{db_username}{display_id}\nВыбери тип рейтинга или жалобы:", reply_markup=kb, parse_mode="Markdown")
+    
+    await message.answer(
+        f"🎯 *Объект распознан!*\n"
+        f"👤 Юзернейм: @{db_username}\n"
+        f"🆔 Telegram ID: {display_id}\n\n"
+        f"Выберите тип рейтинга для отправки на модерацию:", 
+        reply_markup=kb, 
+        parse_mode="Markdown"
+    )
 
 
 @router.callback_query(F.data.startswith("set_type:"))
 async def set_report_type(callback: CallbackQuery, state: FSMContext):
     req_type = callback.data.split(":")[1]
     await state.update_data(req_type=req_type)
-    
     await callback.message.delete()
     await state.set_state(ReportStates.waiting_for_reason)
-    await callback.message.answer("Опишите подробно причину, почему вы решили выставить этот рейтинг / оставить жалобу:")
+    await callback.message.answer("Опишите подробно причину жалобы / выставления рейтинга:")
     await callback.answer()
 
 
 @router.message(ReportStates.waiting_for_reason, F.chat.type == "private")
 async def process_rating_reason(message: Message, state: FSMContext, bot: Bot):
-    if not is_valid_text(message.text):
-        await message.answer("Описание причины слишком короткое. Распишите подробнее, пожалуйста:")
+    if len(message.text.strip()) < 2:
+        await message.answer("Пожалуйста, распишите причину подробнее:")
         return
         
     data = await state.get_data()
     await state.clear()
     
-    # Теперь мы ПЕРЕДАЕМ target_user_id в твою обновленную таблицу!
-    t_id = data.get("target_user_id") if data.get("target_user_id") is not None else 0
+    t_id = data.get("target_user_id", 0)
     
     try:
         await create_moderation_request(
             chat_id=message.chat.id, 
             target_user=data["target_user_str"],
-            target_user_id=t_id,  # Колонка теперь создана в БД!
+            target_user_id=t_id, 
             reporter_id=message.from_user.id, 
             reporter_name=message.from_user.full_name or "Пользователь",
             req_type=data["req_type"], 
             reason=message.text
         )
-        await message.answer("✅ Ваша заявка успешно создана и отправлена команде модерации. Спасибо за бдительность!")
-        await notify_admin_new_request(bot, message.from_user.full_name or "Пользователь")
-    except Exception as db_err:
-        logger.error(f"Ошибка сохранения заявки в Supabase: {db_err}")
-        await message.answer(f"❌ Ошибка бэкенда при создании заявки: {str(db_err)}")
+        await message.answer("✅ Заявка отправлена модераторам. Спасибо!")
+        
+        # Сигнал админу
+        if ADMIN_ID != 0:
+            kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💯 Проверить очередь", callback_data="admin_view_now")]])
+            await bot.send_message(ADMIN_ID, f"👑 *Админ*, прилетела новая жалоба на @{data['username']}!", reply_markup=kb, parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"Ошибка сохранения заявки: {e}")
+        await message.answer(f"❌ Ошибка бэкенда: {e}")
 
 
 # =====================================================================
-# БЛОК: АДМИН-ПАНЕЛЬ
+# ХЭНДЛЕРЫ: ПРОВЕРКА ПОЛЬЗОВАТЕЛЯ (УМНЫЙ ПОИСК С КОНВЕРТАЦИЕЙ)
+# =====================================================================
+
+@router.message(F.text == "🔍 Проверить пользователя")
+async def ask_user_to_check(message: Message, state: FSMContext):
+    await state.set_state(CheckStates.waiting_for_input)
+    await message.answer("Введите @username или цифровой ID для проверки в базе:")
+
+
+@router.message(CheckStates.waiting_for_input, F.chat.type == "private")
+async def check_user_in_db(message: Message, state: FSMContext, bot: Bot):
+    raw_input = message.text.strip()
+    await state.clear()
+    
+    # Запускаем комбо-поиск ID перед тем, как лезть в таблицу скамеров
+    user_id, username = await combo_find_user_id(bot, raw_input)
+    
+    search_id = user_id if user_id else (int(raw_input) if raw_input.isdigit() else 0)
+    search_username = username if username else raw_input.replace("@", "").strip()
+
+    scammer = await get_user_by_id_or_username(user_id=search_id, username=search_username)
+    
+    if scammer:
+        db_username = scammer.get('current_username', search_username)
+        db_id = scammer.get('user_id')
+        id_display = f"`{db_id}`" if db_id and db_id != 0 else "Не найден в кэше"
+        
+        text = (
+            f"🚨 *[ПОЛЬЗОВАТЕЛЬ НАЙДЕН В БАЗЕ СКАМЕРОВ]* 🚨\n\n"
+            f"👤 *Юзернейм:* @{db_username}\n"
+            f"🆔 *Telegram ID:* {id_display}\n\n"
+            f"📊 *Рейтинг:*\n"
+            f"🤡 Клоун: {scammer.get('clown_count', 0)}\n"
+            f"🤔 Подозреваемый: {scammer.get('suspect_count', 0)}\n"
+            f"❤️ Гуд: {scammer.get('good_count', 0)}\n"
+        )
+        if scammer.get('has_proof'):
+            text += f"\n📄 *Пруф:* _{scammer.get('proof_text')}_"
+        await message.answer(text, parse_mode="Markdown")
+    else:
+        await message.answer(f"✅ Пользователь @{search_username} не найден в базе данных скамеров.", parse_mode="Markdown")
+
+# =====================================================================
+# АДМИН-ПАНЕЛЬ (КРАТКАЯ ВЕРСИЯ)
 # =====================================================================
 
 @router.message(F.text == "⚙️ Панель Модератора")
@@ -256,10 +251,6 @@ async def process_rating_reason(message: Message, state: FSMContext, bot: Bot):
 async def admin_view_requests(event):
     user_id = event.from_user.id
     if user_id != ADMIN_ID:
-        if isinstance(event, CallbackQuery):
-            await event.answer("У вас нет прав администратора.", show_alert=True)
-        else:
-            await event.answer("⚠️ Доступ запрещен. Вы не являетесь администратором бота.")
         return
 
     is_callback = isinstance(event, CallbackQuery)
@@ -268,44 +259,31 @@ async def admin_view_requests(event):
     requests = await get_pending_requests()
     if not requests:
         if is_callback:
-            await event.message.edit_text("✨ Все заявки успешно разобраны! Очередь пуста.")
-            await event.answer()
+            await event.message.edit_text("✨ Очередь пуста.")
         else:
-            await message.answer("✨ Все заявки успешно разобраны! Очередь пуста.")
+            await message.answer("✨ Очередь пуста.")
         return
 
     req = requests[0]
     req_id = req['id']
     
-    types_map = {
-        "rating_clown": "🤡 Клоун",
-        "rating_suspect": "🤔 Подозреваемый",
-        "rating_good": "❤️ Гуд",
-        "proof": "📄 Железный Пруф"
-    }
-    human_type = types_map.get(req['req_type'], req['req_type'])
-
-    display_target_id = req.get('target_user_id')
-    id_text = f"`{display_target_id}`" if display_target_id and display_target_id != 0 else "Не найден"
+    t_id = req.get('target_user_id', 0)
+    id_text = f"`{t_id}`" if t_id != 0 else "Не определен"
 
     text = (
-        f"📋 *Новая заявка на модерацию #{req_id}*\n\n"
-        f"👤 *На кого жалоба:* @{req['target_username']} (ID: {id_text})\n"
-        f"🏷️ *Тип действия:* {human_type}\n"
-        f"📝 *Отправитель:* {req['reporter_name']} (ID: {req['reporter_id']})\n"
-        f"💬 *Описание/Пруфы:* {req['reason']}"
+        f"📋 *Заявка #{req_id}*\n\n"
+        f"👤 *Цель:* @{req['target_username']} (ID: {id_text})\n"
+        f"📝 *Отправитель:* {req['reporter_name']}\n"
+        f"💬 *Причина:* {req['reason']}"
     )
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="✅ Одобрить", callback_data=f"approve_{req_id}"),
-            InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{req_id}")
-        ]
-    ])
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Одобрить", callback_data=f"approve_{req_id}"),
+        InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{req_id}")
+    ]])
     
     if is_callback:
         await event.message.edit_text(text, reply_markup=kb, parse_mode="Markdown")
-        await event.answer()
     else:
         await message.answer(text, reply_markup=kb, parse_mode="Markdown")
 
@@ -313,7 +291,6 @@ async def admin_view_requests(event):
 @router.callback_query(F.data.startswith("approve_") | F.data.startswith("reject_"))
 async def handle_decision(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
-        await callback.answer("Куда лезешь? Ты не админ!", show_alert=True)
         return
 
     action, req_id = callback.data.split("_")
@@ -322,55 +299,23 @@ async def handle_decision(callback: CallbackQuery):
     requests = await get_pending_requests()
     current_req = next((r for r in requests if r['id'] == req_id), None)
     
-    if action == "approve":
-        if current_req:
-            is_proof = current_req['req_type'] == "proof"
-            scam_id = current_req.get('target_user_id') if current_req.get('target_user_id') is not None else 0
-            
-            try:
-                # Вносим скамера железно по его ID в основную базу скамеров
-                await add_or_update_scammer_by_id(
-                    user_id=scam_id, 
-                    username=current_req['target_username'],
-                    req_type=current_req['req_type'], 
-                    proof_text=current_req['reason'] if is_proof else None,
-                    has_proof=is_proof
-                )
-                
-                await update_request_status(req_id, "approved")
-                msg_text = f"✅ Заявка #{req_id} одобрена. Данные внесены по ID `{scam_id}` в базу."
-                
-            except Exception as write_err:
-                logger.error(f"Ошибка при записи скамера в базу: {write_err}")
-                msg_text = f"❌ Ошибка Supabase при сохранении скамера: {str(write_err)}"
-        else:
-            msg_text = "❌ Ошибка: не удалось выгрузить данные заявки."
+    if action == "approve" and current_req:
+        is_proof = current_req['req_type'] == "proof"
+        scam_id = current_req.get('target_user_id', 0)
+        
+        await add_or_update_scammer_by_id(
+            user_id=scam_id, 
+            username=current_req['target_username'],
+            req_type=current_req['req_type'], 
+            proof_text=current_req['reason'] if is_proof else None,
+            has_proof=is_proof
+        )
+        await update_request_status(req_id, "approved")
+        await callback.message.answer(f"✅ Одобрено по ID `{scam_id}`")
     else:
-        try:
-            await update_request_status(req_id, "rejected")
-            msg_text = f"❌ Заявка #{req_id} успешно отклонена модератором."
-        except Exception as status_err:
-            msg_text = f"❌ Ошибка изменения статуса заявки: {str(status_err)}"
+        await update_request_status(req_id, "rejected")
+        await callback.message.answer("❌ Отклонено")
         
     await callback.message.delete()
-    await callback.message.answer(msg_text, parse_mode="Markdown")
-    
-    next_requests = await get_pending_requests()
-    if next_requests:
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="Показать следующую заявку ➡️", callback_data="admin_view_now")]
-        ])
-        await callback.message.answer("📥 В очереди модерации еще остались необработанные заявки.", reply_markup=kb)
-    else:
-        await callback.message.answer("✨ Прекрасно! Все заявки из очереди модерации были успешно разобраны.")
-        
+    await admin_view_requests(callback)
     await callback.answer()
-
-
-@router.callback_query(F.data == "admin_close_notify")
-async def close_admin_notification(callback: CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
-        await callback.answer("Нет доступа.", show_alert=True)
-        return
-    await callback.message.delete()
-    await callback.answer("Уведомление закрыто.")
