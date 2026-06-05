@@ -1,5 +1,5 @@
+import re
 import logging
-import asyncio
 from datetime import datetime
 from aiogram import Router, F, Bot
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
@@ -7,7 +7,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.filters import Command, CommandObject
 
-# Импорт клиента Supabase из твоей архитектуры БД
+# Импорт клиента Supabase и твоих системных функций из архитектуры БД
 from database.supabase_db import (
     get_user_by_id_or_username,
     create_moderation_request,
@@ -58,23 +58,36 @@ async def is_admin(user_id: int) -> bool:
         return False
 
 # =====================================================================
-# КЛАВИАТУРЫ (ДИНАМИЧЕСКОЕ ГЛАВНОЕ МЕНЮ И КНОПКИ ОТМЕНЫ)
+# 🛠️ СТРОГИЙ ВАЛИДАТОР ЮЗЕРНЕЙМОВ И ID
+# =====================================================================
+def validate_target_input(text: str) -> str | None:
+    """
+    Проверяет строку на строгое соответствие правилам.
+    Разрешено:
+    1. Только цифры (Telegram ID)
+    2. Юзернейм, начинающийся строго с @, содержащий только A-Z, a-z, 0-9 и _ (от 5 до 32 символов)
+    """
+    if not text:
+        return None
+    cleaned = text.strip()
+    if cleaned.isdigit():
+        return cleaned
+    tg_username_pattern = r"^@[a-zA-Z0-9_]{5,32}$"
+    if re.match(tg_username_pattern, cleaned):
+        return cleaned
+    return None
+
+# =====================================================================
+# КЛАВИАТУРЫ
 # =====================================================================
 async def get_main_menu_kb(user_id: int):
-    """Создает меню кнопок внизу экрана. Если зашел админ — добавляет ему кнопку панели."""
     buttons = [
         [KeyboardButton(text="🔍 Проверить пользователя")],
         [KeyboardButton(text="🚨 Сообщить о пользователе")]
     ]
-    
     if await is_admin(user_id):
         buttons.append([KeyboardButton(text="⚙️ Панель Модератора")])
-        
-    return ReplyKeyboardMarkup(
-        keyboard=buttons,
-        resize_keyboard=True,
-        persistent=True
-    )
+    return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True, persistent=True)
 
 def get_cancel_kb():
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отменить", callback_data="fsm_cancel")]])
@@ -95,12 +108,10 @@ async def combo_resolve_target(bot: Bot, raw_input: str) -> tuple:
     raw_input = raw_input.strip()
     if raw_input.isdigit():
         return int(raw_input), f"id_{raw_input}"
-    
     cleaned = raw_input.replace("@", "").strip().lower()
     cached = await get_cached_user_by_username(cleaned)
     if cached and cached.get("user_id"):
         return int(cached["user_id"]), cleaned
-        
     try:
         chat = await bot.get_chat(f"@{cleaned}")
         return chat.id, (chat.username.lower() if chat.username else cleaned)
@@ -111,10 +122,7 @@ async def combo_resolve_target(bot: Bot, raw_input: str) -> tuple:
 # ОБЩАЯ ЛОГИКА ГЕНЕРАЦИИ ТЕКСТА ПРОВЕРКИ И КНОПОК
 # =====================================================================
 async def build_check_response(bot: Bot, search_id: int, search_username: str, trigger_user_id: int) -> tuple:
-    """Генерирует актуальный текст и клавиатуру на основе текущего состояния БД"""
-    search_username_clean = search_username.strip().lower()
-    
-    # Получаем актуальные данные напрямую из таблицы scammers по правильной колонке current_username
+    search_username_clean = search_username.replace("@", "").strip().lower()
     scammer = {}
     try:
         scam_query = supabase.table("scammers").select("*")
@@ -126,7 +134,7 @@ async def build_check_response(bot: Bot, search_id: int, search_username: str, t
         if scam_res.data:
             scammer = scam_res.data[0]
     except Exception as e:
-        logger.error(f"Ошибка build_check_response при чтении scammers: {e}")
+        logger.error(f"Ошибка build_check_response: {e}")
 
     try:
         query = supabase.table("moderation_requests").select("id").eq("status", "approved").eq("req_type", "proof")
@@ -139,7 +147,6 @@ async def build_check_response(bot: Bot, search_id: int, search_username: str, t
     except Exception:
         proofs = []
     
-    # Расчет статуса безопасности
     if proofs or (scammer and scammer.get("has_proof") is True):
         status_header = "🔴 <b>КРИТИЧЕСКИЙ СТАТУС: СКАМЕР / МОШЕННИК</b> 🔴"
     elif scammer and ((scammer.get("clown_count", 0) or 0) > 0 or (scammer.get("suspect_count", 0) or 0) > 0):
@@ -183,7 +190,6 @@ async def build_check_response(bot: Bot, search_id: int, search_username: str, t
             InlineKeyboardButton(text=f"❤️ Гуд ({goods})", callback_data=f"vote:rating_good:{search_username_clean}:{search_id}")
         ])
     
-    # Если проверяет админ: добавляем скрытую кнопку полной амнистии (удаления) прямо под карточку проверки
     if await is_admin(trigger_user_id):
         buttons.append([InlineKeyboardButton(text="🗑 Полный сброс (Амнистия)", callback_data=f"adm_delete_scam:{search_username_clean}:{search_id}")])
         
@@ -191,38 +197,49 @@ async def build_check_response(bot: Bot, search_id: int, search_username: str, t
     return text, kb
 
 # =====================================================================
-# ОБРАБОТКА ДЛЯ ГРУПП (скам @username / скам в ответ на реплай)
+# ОБРАБОТКА ДЛЯ ГРУПП (С СТРОГОЙ ВАЛИДАЦИЕЙ ВВОДА)
 # =====================================================================
 @router.message(F.chat.type.in_({"group", "supergroup"}), F.text.lower().startswith("скам"))
 async def group_check_handler(message: Message, bot: Bot):
     if not check_cooldown(message.from_user.id, seconds=3):
         return
 
-    parts = message.text.split(maxsplit=1)
-    target_input = ""
+    parts = message.text.strip().split(maxsplit=1)
+    target_input = None
 
     if len(parts) == 1 and message.reply_to_message:
-        target_input = str(message.reply_to_message.from_user.id)
+        target_user = message.reply_to_message.from_user
+        target_input = f"@{target_user.username}" if target_user.username else str(target_user.id)
     elif len(parts) > 1:
         target_input = parts[1].strip()
     else:
         return
 
+    valid_target = validate_target_input(target_input)
+    if not valid_target:
+        await message.reply(
+            "❌ <b>Ошибка формата команды!</b>\n\n"
+            "Пишите строго:\n"
+            "• <code>скам @username</code> (только юзернейм с @)\n"
+            "• <code>скам 12345678</code> (только цифровой ID)\n"
+            "Либо просто ответом (reply) на сообщение скамера словом <b>скам</b> без лишних символов."
+        )
+        return
+
     await bot.send_chat_action(message.chat.id, "typing")
-    user_id, username = await combo_resolve_target(bot, target_input)
-    search_id = user_id if user_id else (int(target_input) if target_input.isdigit() else 0)
-    search_username = username if username else target_input.replace("@", "").strip().lower()
+    user_id, username = await combo_resolve_target(bot, valid_target)
+    search_id = user_id if user_id else (int(valid_target) if valid_target.isdigit() else 0)
+    search_username = username if username else valid_target.replace("@", "").strip().lower()
 
     text, kb = await build_check_response(bot, search_id, search_username, message.from_user.id)
     await message.reply(text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
 
 # =====================================================================
-# КОМАНДА START И ДИПЛИНКИ
+# КОМАНДА START И ДИПЛИНКИ ПРУФОВ
 # =====================================================================
 @router.message(Command("start"), F.chat.type == "private")
 async def cmd_start(message: Message, command: CommandObject, state: FSMContext, bot: Bot):
     await state.clear()
-    
     if command.args and command.args.startswith("p_"):
         try:
             proof_id = int(command.args.split("_")[1])
@@ -230,7 +247,6 @@ async def cmd_start(message: Message, command: CommandObject, state: FSMContext,
             if not res.data:
                 await message.answer("❌ Данное доказательство не найдено.")
                 return
-                
             req = res.data[0]
             caption = f"📄 <b>Обоснование пруфа #{proof_id}:</b>\n\n{req['reason']}"
             m_type = req.get("media_type", "text")
@@ -274,12 +290,17 @@ async def ask_check(message: Message, state: FSMContext):
 @router.message(BotStates.waiting_for_check, F.chat.type == "private")
 async def perform_check(message: Message, state: FSMContext, bot: Bot):
     raw_input = message.text.strip()
-    await state.clear()
+    valid_target = validate_target_input(raw_input)
     
+    if not valid_target:
+        await message.answer("❌ Неверный формат! Введите строго юзернейм начиная с @ (например @username) или только цифры ID.")
+        return
+
+    await state.clear()
     await bot.send_chat_action(message.chat.id, "typing")
-    user_id, username = await combo_resolve_target(bot, raw_input)
-    search_id = user_id if user_id else (int(raw_input) if raw_input.isdigit() else 0)
-    search_username = username if username else raw_input.replace("@", "").strip().lower()
+    user_id, username = await combo_resolve_target(bot, valid_target)
+    search_id = user_id if user_id else (int(valid_target) if valid_target.isdigit() else 0)
+    search_username = username if username else valid_target.replace("@", "").strip().lower()
 
     text, kb = await build_check_response(bot, search_id, search_username, message.from_user.id)
     kb_menu = await get_main_menu_kb(message.from_user.id)
@@ -288,14 +309,13 @@ async def perform_check(message: Message, state: FSMContext, bot: Bot):
     await message.answer("Результат проверки выведен выше.", reply_markup=kb_menu)
 
 # =====================================================================
-# ДВИЖОК ПЕРЕЗАПИСЫВАЕМЫХ РЕАКЦИЙ БЕЗ ДЮПА И НАКРУТОК
+# ДВИЖОК АТОМАРНЫХ РЕАКЦИЙ БЕЗ НАКРУТОК И ОШИБОК 409
 # =====================================================================
 async def apply_user_reaction(reporter_id: int, target_username: str, target_id: int, new_reaction: str) -> str:
     try:
-        t_user_clean = target_username.strip().lower()
+        t_user_clean = target_username.replace("@", "").strip().lower()
         t_id = int(target_id)
         
-        # 1. Проверяем, голосовал ли уже этот юзер за эту цель ранее
         query = supabase.table("user_reactions").select("id", "reaction_type").eq("reporter_id", reporter_id)
         if t_id != 0:
             query = query.eq("target_user_id", t_id)
@@ -303,7 +323,6 @@ async def apply_user_reaction(reporter_id: int, target_username: str, target_id:
             query = query.eq("target_username", t_user_clean)
         existing = query.execute()
         
-        # 2. Ищем запись в scammers строго через current_username
         scam_query = supabase.table("scammers").select("*")
         if t_id != 0:
             scam_query = scam_query.eq("user_id", t_id)
@@ -317,26 +336,20 @@ async def apply_user_reaction(reporter_id: int, target_username: str, target_id:
         suspects = scammer.get("suspect_count", 0) or 0
         goods = scammer.get("good_count", 0) or 0
         
-        # Фикс дюпа: если старый голос найден — вычитаем его корректно
         if existing.data:
             old_rec = existing.data[0]
             old_type = old_rec["reaction_type"]
-            
             if old_type == new_reaction:
                 return "⚠️ Вы уже поставили эту реакцию!"
-                
             if "clown" in old_type: clowns = max(0, clowns - 1)
             elif "suspect" in old_type: suspects = max(0, suspects - 1)
             elif "good" in old_type: goods = max(0, goods - 1)
-            
             supabase.table("user_reactions").delete().eq("id", old_rec["id"]).execute()
 
-        # Прибавляем новый голос
         if "clown" in new_reaction: clowns += 1
         elif "suspect" in new_reaction: suspects += 1
         elif "good" in new_reaction: goods += 1
         
-        # Создаем лог в user_reactions
         supabase.table("user_reactions").insert({
             "reporter_id": reporter_id,
             "target_user_id": t_id,
@@ -344,89 +357,71 @@ async def apply_user_reaction(reporter_id: int, target_username: str, target_id:
             "reaction_type": new_reaction
         }).execute()
         
-        # Синхронизируем итоговые данные в scammers через current_username
-        upd_payload = {
+        scam_payload = {
+            "current_username": t_user_clean,
             "clown_count": clowns,
             "suspect_count": suspects,
             "good_count": goods,
-            "current_username": t_user_clean
+            "has_proof": scammer.get("has_proof", False) if scammer else False
         }
-        
-        if scammer:
-            supabase.table("scammers").update(upd_payload).eq("id", scammer["id"]).execute()
-        else:
-            upd_payload["user_id"] = t_id
-            upd_payload["has_proof"] = False
-            supabase.table("scammers").insert(upd_payload).execute()
+        if t_id != 0:
+            scam_payload["user_id"] = t_id
+
+        conflict_column = "user_id" if t_id != 0 else "current_username"
+        supabase.table("scammers").upsert(scam_payload, on_conflict=conflict_column).execute()
             
         return "✅ Реакция успешно обновлена!"
     except Exception as e:
         logger.error(f"Ошибка в apply_user_reaction: {e}")
-        return "❌ Ошибка обновления базы."
+        return "❌ Ошибка обновления базы данных."
 
 @router.callback_query(F.data.startswith("vote:"))
 async def process_vote_reaction(callback: CallbackQuery, bot: Bot):
     _, reaction_type, t_username, t_id = callback.data.split(":")
     t_id = int(t_id)
-    
     if callback.from_user.id == t_id:
         await callback.answer(TEXTS["self_report"], show_alert=True)
         return
-        
     result_text = await apply_user_reaction(callback.from_user.id, t_username, t_id, reaction_type)
     new_text, new_kb = await build_check_response(bot, t_id, t_username, callback.from_user.id)
-    
     try:
         await callback.message.edit_text(text=new_text, reply_markup=new_kb, parse_mode="HTML", disable_web_page_preview=True)
-    except Exception:
-        pass
-        
+    except Exception: pass
     await callback.answer(result_text, show_alert=False)
 
 # =====================================================================
-# АДМИНСКИЙ ФУНКЦИОНАЛ: УДАЛЕНИЕ ПОЛЬЗОВАТЕЛЯ ИЗ БАЗЫ (АМНИСТИЯ)
+# АДМИНСКИЙ ФУНКЦИОНАЛ: ПОЛНАЯ АМНИСТИЯ / УДАЛЕНИЕ
 # =====================================================================
 @router.callback_query(F.data.startswith("adm_delete_scam:"))
 async def admin_delete_scam_profile(callback: CallbackQuery, bot: Bot):
     if not await is_admin(callback.from_user.id):
         await callback.answer("🔒 У вас нет прав на это действие.", show_alert=True)
         return
-        
     _, t_username, t_id = callback.data.split(":")
     t_id = int(t_id)
-    t_username_clean = t_username.strip().lower()
-    
+    t_username_clean = t_username.replace("@", "").strip().lower()
     try:
-        # 1. Удаляем все логи реакций пользователей по этой цели
         if t_username_clean and t_username_clean != "none":
             supabase.table("user_reactions").delete().eq("target_username", t_username_clean).execute()
         if t_id and t_id != 0:
             supabase.table("user_reactions").delete().eq("target_user_id", t_id).execute()
-            
-        # 2. Удаляем из таблицы scammers, обращаясь к точной колонке current_username
         if t_id and t_id != 0:
             supabase.table("scammers").delete().eq("user_id", t_id).execute()
         if t_username_clean and t_username_clean != "none" and not t_username_clean.startswith("id_"):
             supabase.table("scammers").delete().eq("current_username", t_username_clean).execute()
-            
-        # 3. Подчищаем абсолютно все связанные пруфы и заявки в moderation_requests
         if t_username_clean and t_username_clean != "none":
             supabase.table("moderation_requests").delete().eq("target_username", t_username_clean).execute()
         if t_id and t_id != 0:
             supabase.table("moderation_requests").delete().eq("target_user_id", t_id).execute()
-        
-        await callback.answer("🗑 Все данные, пруфы и реакции пользователя полностью стерты!", show_alert=True)
-        
-        # Перерисовываем карточку обратно в статус "НАДЕЖНЫЙ"
+        await callback.answer("🗑 Все данные, пруфы и реакции пользователя стерты!", show_alert=True)
         new_text, new_kb = await build_check_response(bot, t_id, t_username_clean, callback.from_user.id)
         await callback.message.edit_text(text=new_text, reply_markup=new_kb, parse_mode="HTML")
-        
     except Exception as e:
         logger.error(f"Ошибка при удалении админом: {e}")
-        await callback.answer(f"❌ Ошибка выполнения удаления: {str(e)[:50]}", show_alert=True)
+        await callback.answer(f"❌ Ошибка: {str(e)[:50]}", show_alert=True)
 
 # =====================================================================
-# ПОДАЧА ЖАЛОБЫ С МЕДИАПРУФАМИ (ТОЛЬКО В ЛС)
+# ПОДАЧА ЖАЛОБЫ С ЗАЩИТОЙ ОТ ПОВТОРНЫХ МЕДИА ИЗ МЕДИАГРУПП
 # =====================================================================
 @router.message(F.text == "🚨 Сообщить о пользователе", F.chat.type == "private")
 async def start_report(message: Message, state: FSMContext):
@@ -448,10 +443,13 @@ async def process_target(message: Message, state: FSMContext, bot: Bot):
         user_id = message.forward_from_chat.id
         db_username = message.forward_from_chat.username or message.forward_from_chat.title
     else:
-        user_id, db_username = await combo_resolve_target(bot, message.text)
+        valid = validate_target_input(message.text)
+        if not valid:
+            await message.answer("❌ Неверный формат! Отправьте строго @username или цифровой ID скамера без лишних слов.")
+            return
+        user_id, db_username = await combo_resolve_target(bot, valid)
 
     db_username = db_username.replace("@", "").strip().lower()
-
     kb_menu = await get_main_menu_kb(message.from_user.id)
     if user_id == message.from_user.id:
         await message.answer(TEXTS["self_report"], reply_markup=kb_menu)
@@ -467,18 +465,24 @@ async def process_target(message: Message, state: FSMContext, bot: Bot):
 async def report_action(callback: CallbackQuery, state: FSMContext):
     await callback.message.delete()
     await state.set_state(BotStates.waiting_for_reason)
-    await callback.message.answer("📎 <b>Отправьте доказательства:</b>\nПринимаются скриншоты, видео или файлы с текстовым описанием.", parse_mode="HTML", reply_markup=get_cancel_kb())
+    await callback.message.answer("📎 <b>Отправьте доказательства:</b>\nПринимаются скриншоты, видео или файлы с текстовым описанием ситуации.", parse_mode="HTML", reply_markup=get_cancel_kb())
     await callback.answer()
 
 @router.message(BotStates.waiting_for_reason, F.chat.type == "private")
 async def process_proof_delivery(message: Message, state: FSMContext, bot: Bot):
     data = await state.get_data()
-    await state.clear()
     
+    # ФИКС МЕДИАГРУПП: Если пользователь шлет альбом, капшн/текст есть ТОЛЬКО в первом сообщении.
+    # Если приходят последующие куски медиагруппы БЕЗ текста, мы их просто молча игнорируем,
+    # чтобы не плодить дубликаты одной и той же жалобы.
+    if message.media_group_id and not message.text and not message.caption:
+        return
+
     t_id = data.get("target_user_id", 0)
     t_user = data["target_user_str"]
     
-    reason_text = message.text or message.caption or "Медиа-доказательство без текста"
+    # Берем именно то, что вписал заявитель (сообщение или подпись к медиа)
+    reason_text = message.text or message.caption or "Медиа-доказательство без текстового описания"
     reason_text = reason_text.replace("<", "&lt;").replace(">", "&gt;")
     
     media_type = "text"
@@ -494,11 +498,12 @@ async def process_proof_delivery(message: Message, state: FSMContext, bot: Bot):
         media_type = "document"
         file_id = message.document.file_id
 
+    await state.clear()
     kb_menu = await get_main_menu_kb(message.from_user.id)
     try:
         dup = supabase.table("moderation_requests").select("id").eq("reporter_id", message.from_user.id).eq("target_username", t_user).eq("status", "pending").execute()
         if dup.data:
-            await message.answer("⚠️ У вас уже есть активная жалоба на этого пользователя.", reply_markup=kb_menu)
+            await message.answer("⚠️ У вас уже есть одна активная жалоба на этого пользователя в очереди модерации.", reply_markup=kb_menu)
             return
 
         supabase.table("moderation_requests").insert({
@@ -507,21 +512,20 @@ async def process_proof_delivery(message: Message, state: FSMContext, bot: Bot):
             "req_type": "proof", "reason": reason_text, "media_type": media_type, "file_id": file_id, "status": "pending"
         }).execute()
         
-        await message.answer("✅ <b>Ваши доказательства приняты модерацией!</b>", parse_mode="HTML", reply_markup=kb_menu)
+        await message.answer("✅ <b>Ваши доказательства приняты и отправлены на модерацию!</b>", parse_mode="HTML", reply_markup=kb_menu)
         if await is_admin(PRIMARY_ADMIN_ID):
             await bot.send_message(PRIMARY_ADMIN_ID, f"👑 <b>Новый пруф против @{t_user}!</b>", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⚡ Открыть панель", callback_data="admin_view_now")]]))
     except Exception as e:
-        await message.answer(f"❌ Ошибка сохранения: {e}", reply_markup=kb_menu)
+        await message.answer(f"❌ Ошибка сохранения жалобы: {e}", reply_markup=kb_menu)
 
 # =====================================================================
-# АДМИН-ПАНЕЛЬ (МОДЕРАЦИЯ ОЧЕРЕДИ ЗАЯВЛЕНИЙ)
+# АДМИН-ПАНЕЛЬ (БЕЗ ОШИБОК ПЕРЕРИСОВКИ ИНТЕРФЕЙСА)
 # =====================================================================
 @router.message(Command("admin"), F.chat.type == "private")
 @router.message(F.text == "⚙️ Панель Модератора", F.chat.type == "private")
 @router.callback_query(F.data == "admin_view_now")
 async def admin_dashboard(event, bot: Bot):
-    u_id = event.from_user.id
-    if not await is_admin(u_id):
+    if not await is_admin(event.from_user.id):
         return
     is_cb = isinstance(event, CallbackQuery)
     msg = event.message if is_cb else event
@@ -530,7 +534,7 @@ async def admin_dashboard(event, bot: Bot):
     admin_kb_buttons = [[InlineKeyboardButton(text="➕ Назначить Модератора", callback_data="adm_add_mod")]]
 
     if not requests:
-        text = "✨ <b>Очередь модерации пуста!</b>"
+        text = "✨ <b>Очередь модерации полностью пуста!</b>"
         if is_cb:
             await event.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=admin_kb_buttons))
         else:
@@ -549,7 +553,9 @@ async def admin_dashboard(event, bot: Bot):
     ])
 
     if is_cb:
-        await event.message.delete()
+        try: await event.message.delete()
+        except Exception: pass
+        
     if media_type == "photo" and f_id:
         await bot.send_photo(msg.chat.id, f_id, caption=caption, reply_markup=kb, parse_mode="HTML")
     elif media_type == "video" and f_id:
@@ -562,7 +568,7 @@ async def admin_dashboard(event, bot: Bot):
 @router.callback_query(F.data == "adm_add_mod")
 async def adm_add_mod_start(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id != PRIMARY_ADMIN_ID:
-        await callback.answer("🔒 Доступно только Создателю.", show_alert=True)
+        await callback.answer("🔒 Доступно только Создателю проекта.", show_alert=True)
         return
     await state.set_state(BotStates.waiting_for_new_admin)
     await callback.message.answer("✏️ Введите цифровой Telegram ID нового Модератора:", reply_markup=get_cancel_kb())
@@ -574,39 +580,47 @@ async def adm_add_mod_finish(message: Message, state: FSMContext):
         return
     raw = message.text.strip()
     await state.clear()
-    
     kb_menu = await get_main_menu_kb(message.from_user.id)
     if not raw.isdigit():
-        await message.answer("❌ Неверный ID.", reply_markup=kb_menu)
+        await message.answer("❌ Неверный формат ID.", reply_markup=kb_menu)
         return
     try:
         supabase.table("staff_members").insert({"user_id": int(raw), "assigned_at": datetime.now().isoformat()}).execute()
-        await message.answer(f"🎉 Модератор {raw} успешно добавлен!", parse_mode="HTML", reply_markup=kb_menu)
+        await message.answer(f"🎉 Модератор {raw} успешно добавлен в систему!", parse_mode="HTML", reply_markup=kb_menu)
     except Exception as e:
         await message.answer(f"❌ Ошибка добавления: {e}", reply_markup=kb_menu)
 
 @router.callback_query(F.data.startswith("adm_dec:"))
 async def handle_admin_decision(callback: CallbackQuery, bot: Bot):
     if not await is_admin(callback.from_user.id):
+        await callback.answer("🔒 У вас нет прав.", show_alert=True)
         return
     _, action, r_id = callback.data.split(":")
     r_id = int(r_id)
     try:
         res = supabase.table("moderation_requests").select("*").eq("id", r_id).execute()
-        if res.data:
-            req = res.data[0]
-            if action == "approve":
-                await add_or_update_scammer_by_id(user_id=req['target_user_id'], username=req['target_username'], req_type="proof", proof_text=req['reason'], has_proof=True)
-                await update_request_status(r_id, "approved")
-                try:
-                    await bot.send_message(req['chat_id'], f"✨ Ваше заявление #{r_id} одобрено!")
-                except Exception: pass
-            else:
-                await update_request_status(r_id, "rejected")
-                try:
-                    await bot.send_message(req['chat_id'], f"⚠️ Ваше заявление #{r_id} отклонено.")
-                except Exception: pass
+        if not res.data:
+            await callback.answer("❌ Заявка не найдена в базе данных.")
+            return
+        req = res.data[0]
+        if action == "approve":
+            await add_or_update_scammer_by_id(user_id=req['target_user_id'], username=req['target_username'], req_type="proof", proof_text=req['reason'], has_proof=True)
+            await update_request_status(r_id, "approved")
+            try: await bot.send_message(req['chat_id'], f"✨ Ваше заявление #{r_id} успешно одобрено!")
+            except Exception: pass
+        else:
+            await update_request_status(r_id, "rejected")
+            try: await bot.send_message(req['chat_id'], f"⚠️ Ваше заявление #{r_id} отклонено модерацией.")
+            except Exception: pass
+        await callback.answer("Действие успешно применено!", show_alert=False)
+    except Exception as e:
+        logger.error(f"Ошибка при сохранении решения модератора: {e}")
+        await callback.answer("❌ Ошибка при изменении статуса в БД.", show_alert=True)
+        return
+
+    try:
         await callback.message.delete()
         await admin_dashboard(callback, bot)
-    except Exception:
-        await callback.answer("Ошибка базы данных.")
+    except Exception as e:
+        logger.error(f"Не удалось обновить админ-панель: {e}")
+        await callback.message.answer("📋 Заявка обработана. Введите /admin для обновления экрана панели модератора.")
