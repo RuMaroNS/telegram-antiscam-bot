@@ -108,14 +108,10 @@ async def combo_resolve_target(bot: Bot, raw_input: str) -> tuple:
         return 0, cleaned
 
 # =====================================================================
-# ОБЩАЯ ЛОГИКА ПРОВЕРКИ (ДЛЯ ЛС И ДЛЯ ГРУПП)
+# ОБЩАЯ ЛОГИКА ГЕНЕРАЦИИ ТЕКСТА ПРОВЕРКИ И КНОПОК
 # =====================================================================
-async def execute_user_check(bot: Bot, target_input: str, trigger_user_id: int) -> tuple:
-    """Универсальная функция проверки пользователя в базе данных"""
-    user_id, username = await combo_resolve_target(bot, target_input)
-    search_id = user_id if user_id else (int(target_input) if target_input.isdigit() else 0)
-    search_username = username if username else target_input.replace("@", "").strip().lower()
-
+async def build_check_response(bot: Bot, search_id: int, search_username: str, trigger_user_id: int) -> tuple:
+    """Генерирует актуальный текст и клавиатуру на основе текущего состояния БД"""
     scammer = await get_user_by_id_or_username(user_id=search_id, username=search_username)
     
     try:
@@ -129,6 +125,7 @@ async def execute_user_check(bot: Bot, target_input: str, trigger_user_id: int) 
     except Exception:
         proofs = []
     
+    # Расчет статуса
     if proofs:
         status_header = "🔴 <b>КРИТИЧЕСКИЙ СТАТУС: СКАМЕР / МОШЕННИК</b> 🔴"
     elif scammer and (scammer.get("clown_count", 0) > 0 or scammer.get("suspect_count", 0) > 0):
@@ -163,9 +160,9 @@ async def execute_user_check(bot: Bot, target_input: str, trigger_user_id: int) 
     if trigger_user_id != search_id:
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [
-                InlineKeyboardButton(text="🤡 Клоун", callback_data=f"vote:rating_clown:{search_username}:{search_id}"),
-                InlineKeyboardButton(text="🤔 Подозреваемый", callback_data=f"vote:rating_suspect:{search_username}:{search_id}"),
-                InlineKeyboardButton(text="❤️ Гуд", callback_data=f"vote:rating_good:{search_username}:{search_id}")
+                InlineKeyboardButton(text=f"🤡 Клоун ({clowns})", callback_data=f"vote:rating_clown:{search_username}:{search_id}"),
+                InlineKeyboardButton(text=f"🤔 Искомый ({suspects})", callback_data=f"vote:rating_suspect:{search_username}:{search_id}"),
+                InlineKeyboardButton(text=f"❤️ Гуд ({goods})", callback_data=f"vote:rating_good:{search_username}:{search_id}")
             ]
         ])
         
@@ -183,17 +180,18 @@ async def group_check_handler(message: Message, bot: Bot):
     target_input = ""
 
     if len(parts) == 1 and message.reply_to_message:
-        from_user = message.reply_to_message.from_user
-        target_input = str(from_user.id)
+        target_input = str(message.reply_to_message.from_user.id)
     elif len(parts) > 1:
         target_input = parts[1].strip()
     else:
         return
 
     await bot.send_chat_action(message.chat.id, "typing")
-    text, kb = await execute_user_check(bot, target_input, message.from_user.id)
-    
-    # В группах выводим результат проверки без инлайн-кнопок, чтобы избежать флуда в чате
+    user_id, username = await combo_resolve_target(bot, target_input)
+    search_id = user_id if user_id else (int(target_input) if target_input.isdigit() else 0)
+    search_username = username if username else target_input.replace("@", "").strip().lower()
+
+    text, _ = await build_check_response(bot, search_id, search_username, message.from_user.id)
     await message.reply(text, parse_mode="HTML", disable_web_page_preview=True)
 
 # =====================================================================
@@ -257,15 +255,22 @@ async def perform_check(message: Message, state: FSMContext, bot: Bot):
     await state.clear()
     
     await bot.send_chat_action(message.chat.id, "typing")
-    text, kb = await execute_user_check(bot, raw_input, message.from_user.id)
-    
+    user_id, username = await combo_resolve_target(bot, raw_input)
+    search_id = user_id if user_id else (int(raw_input) if raw_input.isdigit() else 0)
+    search_username = username if username else raw_input.replace("@", "").strip().lower()
+
+    text, kb = await build_check_response(bot, search_id, search_username, message.from_user.id)
     kb_menu = await get_main_menu_kb(message.from_user.id)
-    await message.answer(text, parse_mode="HTML", reply_markup=kb_menu, disable_web_page_preview=True)
+    
     if kb:
-        await message.answer("Вы можете выразить свое отношение к пользователю кнопками реакций ниже:", reply_markup=kb)
+        await message.answer(text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
+        # Отправляем меню кнопок отдельным невидимым пушем, чтобы клавиатура всегда была на экране
+        await message.answer("Результат проверки выведен выше.", reply_markup=kb_menu)
+    else:
+        await message.answer(text, parse_mode="HTML", reply_markup=kb_menu, disable_web_page_preview=True)
 
 # =====================================================================
-# ДВИЖОК ПЕРЕЗАПИСЫВАЕМЫХ РЕАКЦИЙ
+# ДВИЖОК ПЕРЕЗАПИСЫВАЕМЫХ РЕАКЦИЙ С ОБНОВЛЕНИЕМ ТЕКСТА НА ХОДУ
 # =====================================================================
 async def apply_user_reaction(reporter_id: int, target_username: str, target_id: int, new_reaction: str) -> str:
     try:
@@ -287,7 +292,7 @@ async def apply_user_reaction(reporter_id: int, target_username: str, target_id:
             old_rec = existing.data[0]
             old_type = old_rec["reaction_type"]
             if old_type == new_reaction:
-                return "⚠️ Вы уже поставили эту реакцию данному пользователю!"
+                return "⚠️ Вы уже поставили эту реакцию!"
             old_field = f"{old_type.replace('rating_', '')}_count"
             stats[old_field] = max(0, stats[old_field] - 1)
             supabase.table("user_reactions").delete().eq("id", old_rec["id"]).execute()
@@ -304,20 +309,34 @@ async def apply_user_reaction(reporter_id: int, target_username: str, target_id:
         
         await add_or_update_scammer_by_id(user_id=target_id, username=target_username, req_type=new_reaction, proof_text=None, has_proof=False)
         supabase.table("scammers").update({"clown_count": stats["clown_count"], "suspect_count": stats["suspect_count"], "good_count": stats["good_count"]}).eq("user_id", target_id if target_id != 0 else -1).execute()
-        return "✅ Реакция обновлена! Старый голос аннулирован."
+        return "✅ Реакция успешно учтена!"
     except Exception as e:
         logger.error(f"Ошибка реакций: {e}")
-        return "❌ Ошибка обновления реакции базы."
+        return "❌ Ошибка обновления базы."
 
 @router.callback_query(F.data.startswith("vote:"))
-async def process_vote_reaction(callback: CallbackQuery):
+async def process_vote_reaction(callback: CallbackQuery, bot: Bot):
     _, reaction_type, t_username, t_id = callback.data.split(":")
     t_id = int(t_id)
+    
     if callback.from_user.id == t_id:
         await callback.answer(TEXTS["self_report"], show_alert=True)
         return
+        
+    # Применяем изменения в БД Supabase
     result_text = await apply_user_reaction(callback.from_user.id, t_username, t_id, reaction_type)
-    await callback.answer(result_text, show_alert=True)
+    
+    # Генерируем абсолютно новый текст и кнопки на основе свежих данных
+    new_text, new_kb = await build_check_response(bot, t_id, t_username, callback.from_user.id)
+    
+    # Мгновенно обновляем интерфейс старого сообщения без создания новых сообщений
+    try:
+        await callback.message.edit_text(text=new_text, reply_markup=new_kb, parse_mode="HTML", disable_web_page_preview=True)
+    except Exception as e:
+        # Если текст сообщения не изменился (например кликнули на то же самое повторно) - пропускаем ошибку aiogram
+        pass
+        
+    await callback.answer(result_text, show_alert=False)
 
 # =====================================================================
 # ПОДАЧА ЖАЛОБЫ С МЕДИАПРУФАМИ (ТОЛЬКО В ЛС)
