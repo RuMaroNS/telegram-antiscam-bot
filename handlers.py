@@ -112,23 +112,37 @@ async def combo_resolve_target(bot: Bot, raw_input: str) -> tuple:
 # =====================================================================
 async def build_check_response(bot: Bot, search_id: int, search_username: str, trigger_user_id: int) -> tuple:
     """Генерирует актуальный текст и клавиатуру на основе текущего состояния БД"""
-    scammer = await get_user_by_id_or_username(user_id=search_id, username=search_username)
+    search_username_clean = search_username.strip().lower()
     
+    # Получаем актуальные данные напрямую из таблицы scammers по правильной колонке current_username
+    scammer = {}
+    try:
+        scam_query = supabase.table("scammers").select("*")
+        if search_id and search_id != 0:
+            scam_query = scam_query.eq("user_id", search_id)
+        else:
+            scam_query = scam_query.eq("current_username", search_username_clean)
+        scam_res = scam_query.execute()
+        if scam_res.data:
+            scammer = scam_res.data[0]
+    except Exception as e:
+        logger.error(f"Ошибка build_check_response при чтении scammers: {e}")
+
     try:
         query = supabase.table("moderation_requests").select("id").eq("status", "approved").eq("req_type", "proof")
         if search_id and search_id != 0:
             query = query.eq("target_user_id", search_id)
         else:
-            query = query.eq("target_username", search_username.lower())
+            query = query.eq("target_username", search_username_clean)
         res = query.execute()
         proofs = res.data
     except Exception:
         proofs = []
     
     # Расчет статуса безопасности
-    if proofs:
+    if proofs or (scammer and scammer.get("has_proof") is True):
         status_header = "🔴 <b>КРИТИЧЕСКИЙ СТАТУС: СКАМЕР / МОШЕННИК</b> 🔴"
-    elif scammer and (scammer.get("clown_count", 0) > 0 or scammer.get("suspect_count", 0) > 0):
+    elif scammer and ((scammer.get("clown_count", 0) or 0) > 0 or (scammer.get("suspect_count", 0) or 0) > 0):
         status_header = "🟡 <b>ВНИМАНИЕ: ЕСТЬ ЖАЛОБЫ В СИСТЕМЕ РЕАКЦИЙ</b> 🟡"
     else:
         status_header = "🟢 <b>АНАЛИЗ ЗАВЕРШЕН: НАДЕЖНЫЙ ПОЛЬЗОВАТЕЛЬ</b> 🟢"
@@ -136,11 +150,16 @@ async def build_check_response(bot: Bot, search_id: int, search_username: str, t
     clowns = scammer.get("clown_count", 0) if scammer else 0
     suspects = scammer.get("suspect_count", 0) if scammer else 0
     goods = scammer.get("good_count", 0) if scammer else 0
+    
+    clowns = clowns if clowns is not None else 0
+    suspects = suspects if suspects is not None else 0
+    goods = goods if goods is not None else 0
+    
     db_id_text = f"<code>{scammer.get('user_id', search_id)}</code>" if scammer else f"<code>{search_id}</code>"
 
     text = (
         f"{status_header}\n\n"
-        f"👤 <b>Юзернейм:</b> @{search_username}\n"
+        f"👤 <b>Юзернейм:</b> @{search_username_clean}\n"
         f"🆔 <b>Telegram ID:</b> {db_id_text}\n\n"
         f"📊 <b>Активность системы реакций:</b>\n"
         f"🤡 Клоун: {clowns}\n"
@@ -159,14 +178,14 @@ async def build_check_response(bot: Bot, search_id: int, search_username: str, t
     buttons = []
     if trigger_user_id != search_id:
         buttons.append([
-            InlineKeyboardButton(text=f"🤡 Клоун ({clowns})", callback_data=f"vote:rating_clown:{search_username}:{search_id}"),
-            InlineKeyboardButton(text=f"🤔 Искомый ({suspects})", callback_data=f"vote:rating_suspect:{search_username}:{search_id}"),
-            InlineKeyboardButton(text=f"❤️ Гуд ({goods})", callback_data=f"vote:rating_good:{search_username}:{search_id}")
+            InlineKeyboardButton(text=f"🤡 Клоун ({clowns})", callback_data=f"vote:rating_clown:{search_username_clean}:{search_id}"),
+            InlineKeyboardButton(text=f"🤔 Искомый ({suspects})", callback_data=f"vote:rating_suspect:{search_username_clean}:{search_id}"),
+            InlineKeyboardButton(text=f"❤️ Гуд ({goods})", callback_data=f"vote:rating_good:{search_username_clean}:{search_id}")
         ])
     
-    # ЕСЛИ ПРОВЕРЯЕТ АДМИН: добавляем скрытую кнопку полной амнистии (удаления) прямо под карточку проверки
+    # Если проверяет админ: добавляем скрытую кнопку полной амнистии (удаления) прямо под карточку проверки
     if await is_admin(trigger_user_id):
-        buttons.append([InlineKeyboardButton(text="🗑 Полный сброс (Амнистия)", callback_data=f"adm_delete_scam:{search_username}:{search_id}")])
+        buttons.append([InlineKeyboardButton(text="🗑 Полный сброс (Амнистия)", callback_data=f"adm_delete_scam:{search_username_clean}:{search_id}")])
         
     kb = InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
     return text, kb
@@ -195,8 +214,6 @@ async def group_check_handler(message: Message, bot: Bot):
     search_username = username if username else target_input.replace("@", "").strip().lower()
 
     text, kb = await build_check_response(bot, search_id, search_username, message.from_user.id)
-    
-    # В группах для админов оставляем кнопку удаления, для обычных юзеров кнопок не будет
     await message.reply(text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
 
 # =====================================================================
@@ -275,22 +292,32 @@ async def perform_check(message: Message, state: FSMContext, bot: Bot):
 # =====================================================================
 async def apply_user_reaction(reporter_id: int, target_username: str, target_id: int, new_reaction: str) -> str:
     try:
-        # Ищем, голосовал ли уже этот юзер за эту цель ранее
+        t_user_clean = target_username.strip().lower()
+        t_id = int(target_id)
+        
+        # 1. Проверяем, голосовал ли уже этот юзер за эту цель ранее
         query = supabase.table("user_reactions").select("id", "reaction_type").eq("reporter_id", reporter_id)
-        if target_id and target_id != 0:
-            query = query.eq("target_user_id", target_id)
+        if t_id != 0:
+            query = query.eq("target_user_id", t_id)
         else:
-            query = query.eq("target_username", target_username.lower())
+            query = query.eq("target_username", t_user_clean)
         existing = query.execute()
         
-        scammer = await get_user_by_id_or_username(user_id=target_id, username=target_username)
+        # 2. Ищем запись в scammers строго через current_username
+        scam_query = supabase.table("scammers").select("*")
+        if t_id != 0:
+            scam_query = scam_query.eq("user_id", t_id)
+        else:
+            scam_query = scam_query.eq("current_username", t_user_clean)
+        scam_res = scam_query.execute()
         
-        # Загружаем текущие чистые счетчики из таблицы scammers (если записи нет — всё по нулям)
-        clowns = scammer.get("clown_count", 0) if scammer else 0
-        suspects = scammer.get("suspect_count", 0) if scammer else 0
-        goods = scammer.get("good_count", 0) if scammer else 0
+        scammer = scam_res.data[0] if scam_res.data else {}
         
-        # Фикс дюпа: если старый голос найден
+        clowns = scammer.get("clown_count", 0) or 0
+        suspects = scammer.get("suspect_count", 0) or 0
+        goods = scammer.get("good_count", 0) or 0
+        
+        # Фикс дюпа: если старый голос найден — вычитаем его корректно
         if existing.data:
             old_rec = existing.data[0]
             old_type = old_rec["reaction_type"]
@@ -298,49 +325,43 @@ async def apply_user_reaction(reporter_id: int, target_username: str, target_id:
             if old_type == new_reaction:
                 return "⚠️ Вы уже поставили эту реакцию!"
                 
-            # Безопасно вычитаем старый голос
             if "clown" in old_type: clowns = max(0, clowns - 1)
             elif "suspect" in old_type: suspects = max(0, suspects - 1)
             elif "good" in old_type: goods = max(0, goods - 1)
             
-            # Удаляем прошлую запись лога из БД
             supabase.table("user_reactions").delete().eq("id", old_rec["id"]).execute()
 
-        # Прибавляем новый голос к соответствующей переменной
+        # Прибавляем новый голос
         if "clown" in new_reaction: clowns += 1
         elif "suspect" in new_reaction: suspects += 1
         elif "good" in new_reaction: goods += 1
         
-        # Создаем новую запись в логах реакций
+        # Создаем лог в user_reactions
         supabase.table("user_reactions").insert({
             "reporter_id": reporter_id,
-            "target_user_id": target_id,
-            "target_username": target_username.lower(),
+            "target_user_id": t_id,
+            "target_username": t_user_clean,
             "reaction_type": new_reaction
         }).execute()
         
-        # Синхронизируем итоговые агрегированные данные напрямую в таблицу scammers
-        target_uid_for_db = target_id if target_id != 0 else -1
-        
-        # Проверяем физическое существование строки в scammers
-        check_scam_row = supabase.table("scammers").select("user_id").eq("user_id", target_uid_for_db).execute()
-        
+        # Синхронизируем итоговые данные в scammers через current_username
         upd_payload = {
             "clown_count": clowns,
             "suspect_count": suspects,
             "good_count": goods,
-            "username": target_username.lower()
+            "current_username": t_user_clean
         }
         
-        if check_scam_row.data:
-            supabase.table("scammers").update(upd_payload).eq("user_id", target_uid_for_db).execute()
+        if scammer:
+            supabase.table("scammers").update(upd_payload).eq("id", scammer["id"]).execute()
         else:
-            upd_payload["user_id"] = target_uid_for_db
+            upd_payload["user_id"] = t_id
+            upd_payload["has_proof"] = False
             supabase.table("scammers").insert(upd_payload).execute()
             
         return "✅ Реакция успешно обновлена!"
     except Exception as e:
-        logger.error(f"Ошибка реакций: {e}")
+        logger.error(f"Ошибка в apply_user_reaction: {e}")
         return "❌ Ошибка обновления базы."
 
 @router.callback_query(F.data.startswith("vote:"))
@@ -363,7 +384,7 @@ async def process_vote_reaction(callback: CallbackQuery, bot: Bot):
     await callback.answer(result_text, show_alert=False)
 
 # =====================================================================
-# АДМИНСКИЙ ФУНКЦИОНАЛ: УДАЛЕНИЕ / АМНИСТИЯ ЗАПИСИ ИЗ БАЗЫ
+# АДМИНСКИЙ ФУНКЦИОНАЛ: УДАЛЕНИЕ ПОЛЬЗОВАТЕЛЯ ИЗ БАЗЫ (АМНИСТИЯ)
 # =====================================================================
 @router.callback_query(F.data.startswith("adm_delete_scam:"))
 async def admin_delete_scam_profile(callback: CallbackQuery, bot: Bot):
@@ -373,30 +394,36 @@ async def admin_delete_scam_profile(callback: CallbackQuery, bot: Bot):
         
     _, t_username, t_id = callback.data.split(":")
     t_id = int(t_id)
+    t_username_clean = t_username.strip().lower()
     
     try:
-        # 1. Стираем все зафиксированные голоса/реакции юзеров против этой цели
-        supabase.table("user_reactions").delete().eq("target_username", t_username.lower()).execute()
+        # 1. Удаляем все логи реакций пользователей по этой цели
+        if t_username_clean and t_username_clean != "none":
+            supabase.table("user_reactions").delete().eq("target_username", t_username_clean).execute()
         if t_id and t_id != 0:
             supabase.table("user_reactions").delete().eq("target_user_id", t_id).execute()
             
-        # 2. Удаляем карту пользователя из основной таблицы scammers
-        supabase.table("scammers").delete().eq("username", t_username.lower()).execute()
+        # 2. Удаляем из таблицы scammers, обращаясь к точной колонке current_username
         if t_id and t_id != 0:
             supabase.table("scammers").delete().eq("user_id", t_id).execute()
+        if t_username_clean and t_username_clean != "none" and not t_username_clean.startswith("id_"):
+            supabase.table("scammers").delete().eq("current_username", t_username_clean).execute()
             
-        # 3. Аннулируем все поданные или утвержденные жалобы с пруфами модерации
-        supabase.table("moderation_requests").delete().eq("target_username", t_username.lower()).execute()
+        # 3. Подчищаем абсолютно все связанные пруфы и заявки в moderation_requests
+        if t_username_clean and t_username_clean != "none":
+            supabase.table("moderation_requests").delete().eq("target_username", t_username_clean).execute()
+        if t_id and t_id != 0:
+            supabase.table("moderation_requests").delete().eq("target_user_id", t_id).execute()
         
-        await callback.answer("🗑 Все данные пользователя, пруфы и реакции полностью стерты из системы!", show_alert=True)
+        await callback.answer("🗑 Все данные, пруфы и реакции пользователя полностью стерты!", show_alert=True)
         
-        # Перерисовываем карточку (теперь она вернет статус "НАДЕЖНЫЙ ПОЛЬЗОВАТЕЛЬ" с нулями)
-        new_text, new_kb = await build_check_response(bot, t_id, t_username, callback.from_user.id)
+        # Перерисовываем карточку обратно в статус "НАДЕЖНЫЙ"
+        new_text, new_kb = await build_check_response(bot, t_id, t_username_clean, callback.from_user.id)
         await callback.message.edit_text(text=new_text, reply_markup=new_kb, parse_mode="HTML")
         
     except Exception as e:
-        logger.error(f"Ошибка удаления: {e}")
-        await callback.answer("❌ Ошибка выполнения процедуры удаления из базы Supabase.", show_alert=True)
+        logger.error(f"Ошибка при удалении админом: {e}")
+        await callback.answer(f"❌ Ошибка выполнения удаления: {str(e)[:50]}", show_alert=True)
 
 # =====================================================================
 # ПОДАЧА ЖАЛОБЫ С МЕДИАПРУФАМИ (ТОЛЬКО В ЛС)
