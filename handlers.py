@@ -2,7 +2,7 @@ import logging
 import asyncio
 from datetime import datetime
 from aiogram import Router, F, Bot
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.filters import Command, CommandObject
@@ -37,21 +37,13 @@ TEXTS = {
 }
 
 # =====================================================================
-# КЛАВИАТУРЫ (ГЛАВНОЕ МЕНЮ И КНОПКИ ОТМЕНЫ)
+# СОСТОЯНИЯ FSM
 # =====================================================================
-def get_main_menu_kb():
-    """Создает постоянные кнопки внизу экрана в ЛС бота"""
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="🔍 Проверить пользователя")],
-            [KeyboardButton(text="🚨 Сообщить о пользователе")]
-        ],
-        resize_keyboard=True,
-        persistent=True
-    )
-
-def get_cancel_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отменить", callback_data="fsm_cancel")]])
+class BotStates(StatesGroup):
+    waiting_for_target = State()
+    waiting_for_reason = State()
+    waiting_for_check = State()
+    waiting_for_new_admin = State()
 
 # =====================================================================
 # ДИНАМИЧЕСКИЙ МЕНЕДЖЕР АДМИНИСТРАТОРОВ (staff_members)
@@ -66,7 +58,29 @@ async def is_admin(user_id: int) -> bool:
         return False
 
 # =====================================================================
-# ВСПУМОГАТЕЛЬНЫЕ ФУНКЦИИ И РЕЗОЛВЕР
+# КЛАВИАТУРЫ (ДИНАМИЧЕСКОЕ ГЛАВНОЕ МЕНЮ И КНОПКИ ОТМЕНЫ)
+# =====================================================================
+async def get_main_menu_kb(user_id: int):
+    """Создает меню кнопок внизу экрана. Если зашел админ — добавляет ему кнопку панели."""
+    buttons = [
+        [KeyboardButton(text="🔍 Проверить пользователя")],
+        [KeyboardButton(text="🚨 Сообщить о пользователе")]
+    ]
+    
+    if await is_admin(user_id):
+        buttons.append([KeyboardButton(text="⚙️ Панель Модератора")])
+        
+    return ReplyKeyboardMarkup(
+        keyboard=buttons,
+        resize_keyboard=True,
+        persistent=True
+    )
+
+def get_cancel_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отменить", callback_data="fsm_cancel")]])
+
+# =====================================================================
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ И РЕЗОЛВЕР
 # =====================================================================
 user_cooldowns = {}
 
@@ -92,15 +106,6 @@ async def combo_resolve_target(bot: Bot, raw_input: str) -> tuple:
         return chat.id, (chat.username.lower() if chat.username else cleaned)
     except Exception:
         return 0, cleaned
-
-# =====================================================================
-# СОСТОЯНИЯ FSM
-# =====================================================================
-class BotStates(StatesGroup):
-    waiting_for_target = State()
-    waiting_for_reason = State()
-    waiting_for_check = State()
-    waiting_for_new_admin = State()
 
 # =====================================================================
 # ОБЩАЯ ЛОГИКА ПРОВЕРКИ (ДЛЯ ЛС И ДЛЯ ГРУПП)
@@ -154,7 +159,6 @@ async def execute_user_check(bot: Bot, target_input: str, trigger_user_id: int) 
             text += f"🔘 <a href='{link}'>Скам {idx}</a>  "
         text += "\n"
 
-    # Кнопки реакций выводятся только если проверяемый — не тот, кто проверяет
     kb = None
     if trigger_user_id != search_id:
         kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -168,7 +172,7 @@ async def execute_user_check(bot: Bot, target_input: str, trigger_user_id: int) 
     return text, kb
 
 # =====================================================================
-# ОБРАБОТКА ДЛЯ ГРУПП (Пункт: скам @username)
+# ОБРАБОТКА ДЛЯ ГРУПП (скам @username / скам в ответ на реплай)
 # =====================================================================
 @router.message(F.chat.type.in_({"group", "supergroup"}), F.text.lower().startswith("скам"))
 async def group_check_handler(message: Message, bot: Bot):
@@ -178,11 +182,9 @@ async def group_check_handler(message: Message, bot: Bot):
     parts = message.text.split(maxsplit=1)
     target_input = ""
 
-    # Если написали просто "скам" ответом на сообщение
     if len(parts) == 1 and message.reply_to_message:
         from_user = message.reply_to_message.from_user
         target_input = str(from_user.id)
-    # Если написали "скам @username" или "скам ID"
     elif len(parts) > 1:
         target_input = parts[1].strip()
     else:
@@ -191,7 +193,7 @@ async def group_check_handler(message: Message, bot: Bot):
     await bot.send_chat_action(message.chat.id, "typing")
     text, kb = await execute_user_check(bot, target_input, message.from_user.id)
     
-    # В группах выводим информацию БЕЗ инлайн-кнопок реакций, чтобы не флудили
+    # В группах выводим результат проверки без инлайн-кнопок, чтобы избежать флуда в чате
     await message.reply(text, parse_mode="HTML", disable_web_page_preview=True)
 
 # =====================================================================
@@ -227,8 +229,8 @@ async def cmd_start(message: Message, command: CommandObject, state: FSMContext,
             await message.answer(f"❌ Ошибка загрузки медиа-пруфа: {e}")
             return
 
-    # Железно выдаем главное меню при старте
-    await message.answer(TEXTS["welcome"], parse_mode="HTML", reply_markup=get_main_menu_kb())
+    kb = await get_main_menu_kb(message.from_user.id)
+    await message.answer(TEXTS["welcome"], parse_mode="HTML", reply_markup=kb)
 
 # =====================================================================
 # СБРОС СОСТОЯНИЙ И ОТМЕНА
@@ -237,11 +239,12 @@ async def cmd_start(message: Message, command: CommandObject, state: FSMContext,
 async def cancel_fsm(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.message.delete()
-    await callback.message.answer(TEXTS["cancel_ok"], reply_markup=get_main_menu_kb())
+    kb = await get_main_menu_kb(callback.from_user.id)
+    await callback.message.answer(TEXTS["cancel_ok"], reply_markup=kb)
     await callback.answer()
 
 # =====================================================================
-# РАБОТА В ЛИСЕ (КНОПКА: ПРОГНОЗ/ПРОВЕРКА)
+# РАБОТА В ЛС (КНОПКА: ПРОВЕРКА ПОЛЬЗОВАТЕЛЯ)
 # =====================================================================
 @router.message(F.text == "🔍 Проверить пользователя", F.chat.type == "private")
 async def ask_check(message: Message, state: FSMContext):
@@ -256,13 +259,13 @@ async def perform_check(message: Message, state: FSMContext, bot: Bot):
     await bot.send_chat_action(message.chat.id, "typing")
     text, kb = await execute_user_check(bot, raw_input, message.from_user.id)
     
-    # В личке выводим результат С кнопками реакций и возвращаем клавиатуру меню
-    await message.answer(text, parse_mode="HTML", reply_markup=get_main_menu_kb(), disable_web_page_preview=True)
+    kb_menu = await get_main_menu_kb(message.from_user.id)
+    await message.answer(text, parse_mode="HTML", reply_markup=kb_menu, disable_web_page_preview=True)
     if kb:
         await message.answer("Вы можете выразить свое отношение к пользователю кнопками реакций ниже:", reply_markup=kb)
 
 # =====================================================================
-# ДВИЖОК ПЕРЕЗАПИСЫВАЕМЫХ РЕАКЦИЙ С ЗАЩИТОЙ ОТ НАКРУТОК
+# ДВИЖОК ПЕРЕЗАПИСЫВАЕМЫХ РЕАКЦИЙ
 # =====================================================================
 async def apply_user_reaction(reporter_id: int, target_username: str, target_id: int, new_reaction: str) -> str:
     try:
@@ -343,8 +346,9 @@ async def process_target(message: Message, state: FSMContext, bot: Bot):
 
     db_username = db_username.replace("@", "").strip().lower()
 
+    kb_menu = await get_main_menu_kb(message.from_user.id)
     if user_id == message.from_user.id:
-        await message.answer(TEXTS["self_report"], reply_markup=get_main_menu_kb())
+        await message.answer(TEXTS["self_report"], reply_markup=kb_menu)
         await state.clear()
         return
 
@@ -384,10 +388,11 @@ async def process_proof_delivery(message: Message, state: FSMContext, bot: Bot):
         media_type = "document"
         file_id = message.document.file_id
 
+    kb_menu = await get_main_menu_kb(message.from_user.id)
     try:
         dup = supabase.table("moderation_requests").select("id").eq("reporter_id", message.from_user.id).eq("target_username", t_user).eq("status", "pending").execute()
         if dup.data:
-            await message.answer("⚠️ У вас уже есть активная жалоба на этого пользователя.", reply_markup=get_main_menu_kb())
+            await message.answer("⚠️ У вас уже есть активная жалоба на этого пользователя.", reply_markup=kb_menu)
             return
 
         supabase.table("moderation_requests").insert({
@@ -396,15 +401,16 @@ async def process_proof_delivery(message: Message, state: FSMContext, bot: Bot):
             "req_type": "proof", "reason": reason_text, "media_type": media_type, "file_id": file_id, "status": "pending"
         }).execute()
         
-        await message.answer("✅ <b>Ваши доказательства приняты модерацией!</b>", parse_mode="HTML", reply_markup=get_main_menu_kb())
+        await message.answer("✅ <b>Ваши доказательства приняты модерацией!</b>", parse_mode="HTML", reply_markup=kb_menu)
         if await is_admin(PRIMARY_ADMIN_ID):
             await bot.send_message(PRIMARY_ADMIN_ID, f"👑 <b>Новый пруф против @{t_user}!</b>", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⚡ Открыть панель", callback_data="admin_view_now")]]))
     except Exception as e:
-        await message.answer(f"❌ Ошибка сохранения: {e}", reply_markup=get_main_menu_kb())
+        await message.answer(f"❌ Ошибка сохранения: {e}", reply_markup=kb_menu)
 
 # =====================================================================
 # АДМИН-ПАНЕЛЬ
 # =====================================================================
+@router.message(Command("admin"), F.chat.type == "private")
 @router.message(F.text == "⚙️ Панель Модератора", F.chat.type == "private")
 @router.callback_query(F.data == "admin_view_now")
 async def admin_dashboard(event, bot: Bot):
@@ -419,7 +425,10 @@ async def admin_dashboard(event, bot: Bot):
 
     if not requests:
         text = "✨ <b>Очередь модерации пуста!</b>"
-        await (event.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=admin_kb_buttons)) if is_cb else msg.answer(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=admin_kb_buttons)))
+        if is_cb:
+            await event.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=admin_kb_buttons))
+        else:
+            await msg.answer(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=admin_kb_buttons))
         return
 
     req = requests[0]
@@ -459,14 +468,16 @@ async def adm_add_mod_finish(message: Message, state: FSMContext):
         return
     raw = message.text.strip()
     await state.clear()
+    
+    kb_menu = await get_main_menu_kb(message.from_user.id)
     if not raw.isdigit():
-        await message.answer("❌ Неверный ID.", reply_markup=get_main_menu_kb())
+        await message.answer("❌ Неверный ID.", reply_markup=kb_menu)
         return
     try:
         supabase.table("staff_members").insert({"user_id": int(raw), "assigned_at": datetime.now().isoformat()}).execute()
-        await message.answer(f"🎉 Модератор {raw} успешно добавлен!", parse_mode="HTML", reply_markup=get_main_menu_kb())
+        await message.answer(f"🎉 Модератор {raw} успешно добавлен!", parse_mode="HTML", reply_markup=kb_menu)
     except Exception as e:
-        await message.answer(f"❌ Ошибка добавления: {e}", reply_markup=get_main_menu_kb())
+        await message.answer(f"❌ Ошибка добавления: {e}", reply_markup=kb_menu)
 
 @router.callback_query(F.data.startswith("adm_dec:"))
 async def handle_admin_decision(callback: CallbackQuery, bot: Bot):
