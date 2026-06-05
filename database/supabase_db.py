@@ -26,16 +26,15 @@ async def create_moderation_request(
     media_file_id: str = None
 ):
     """
-    Создает новую заявку на модерацию реакции или пруфа в таблице moderation_requests.
-    Сохраняет как текстовый юзернейм нарушителя, так и его цифровой ID.
+    Создает новую заявку на модерацию в таблице moderation_requests.
     """
     try:
         cleaned_username = target_user.lower().replace("@", "").strip() if target_user else "unknown"
         
         data = {
             "chat_id": chat_id,
-            "target_username": f"@{cleaned_username}",
-            "target_user_id": target_user_id,
+            "target_username": cleaned_username,
+            "target_user_id": target_user_id or 0,
             "reporter_id": reporter_id,
             "reporter_name": reporter_name,
             "req_type": req_type,
@@ -76,17 +75,14 @@ async def update_request_status(req_id: int, status: str):
 
 async def get_user_by_id_or_username(user_id: int = None, username: str = None):
     """
-    ТА САМАЯ ФУНКЦИЯ, КОТОРУЮ НЕ МОГ НАЙТИ БОТ.
-    Ищет пользователя в основной базе скамеров по ID или по логину маленькими буквами.
+    Ищет пользователя в основной базе скамеров по ID или по логину.
     """
     try:
-        # Шаг 1: Ищем жестко по цифровому ID
-        if user_id:
+        if user_id and user_id != 0:
             response = supabase.table("scammers").select("*").eq("user_id", user_id).execute()
             if response.data:
                 return response.data[0]
 
-        # Шаг 2: Если по ID не нашли, ищем по тексту в нижнем регистре
         if username:
             cleaned_username = username.lower().replace("@", "").strip()
             response = supabase.table("scammers").select("*").eq("current_username", cleaned_username).execute()
@@ -107,40 +103,57 @@ async def add_or_update_scammer_by_id(
     has_proof: bool = False
 ):
     """
-    Добавляет новую запись или инкрементирует счетчики реакций строго по user_id.
+    Умный апдейт/добавление скамеров. Защищен от дублирования нулевых ID.
     """
     try:
         cleaned_username = username.lower().replace("@", "").strip() if username else None
-        existing_user = await get_user_by_id_or_username(user_id=user_id, username=cleaned_username)
-
+        
         clown_inc = 1 if req_type == "rating_clown" else 0
         suspect_inc = 1 if req_type == "rating_suspect" else 0
         good_inc = 1 if req_type == "rating_good" else 0
 
-        if existing_user:
-            new_clown = existing_user.get("clown_count", 0) + clown_inc
-            new_suspect = existing_user.get("suspect_count", 0) + suspect_inc
-            new_good = existing_user.get("good_count", 0) + good_inc
-            
-            final_has_proof = existing_user.get("has_proof", False) or has_proof
-            final_proof_text = proof_text if proof_text else existing_user.get("proof_text")
+        # Если ТГ-айди нет, ищем и обновляем строго по юзернейму
+        if not user_id or user_id == 0:
+            response = supabase.table("scammers").select("*").eq("current_username", cleaned_username).execute()
+            if response.data:
+                existing = response.data[0]
+                supabase.table("scammers").update({
+                    "clown_count": existing.get("clown_count", 0) + clown_inc,
+                    "suspect_count": existing.get("suspect_count", 0) + suspect_inc,
+                    "good_count": existing.get("good_count", 0) + good_inc,
+                    "has_proof": existing.get("has_proof", False) or has_proof,
+                    "proof_text": proof_text if has_proof else existing.get("proof_text")
+                }).eq("current_username", cleaned_username).execute()
+            else:
+                supabase.table("scammers").insert({
+                    "user_id": 0,
+                    "current_username": cleaned_username,
+                    "clown_count": clown_inc,
+                    "suspect_count": suspect_inc,
+                    "good_count": good_inc,
+                    "has_proof": has_proof,
+                    "proof_text": proof_text
+                }).execute()
+            return
 
+        # Если нормальный ID есть — работаем по ID
+        existing_user = await get_user_by_id_or_username(user_id=user_id, username=cleaned_username)
+
+        if existing_user:
             updated_fields = {
                 "current_username": cleaned_username or existing_user.get("current_username"),
-                "clown_count": new_clown,
-                "suspect_count": new_suspect,
-                "good_count": new_good,
-                "has_proof": final_has_proof,
-                "proof_text": final_proof_text
+                "clown_count": existing_user.get("clown_count", 0) + clown_inc,
+                "suspect_count": existing_user.get("suspect_count", 0) + suspect_inc,
+                "good_count": existing_user.get("good_count", 0) + good_inc,
+                "has_proof": existing_user.get("has_proof", False) or has_proof,
+                "proof_text": proof_text if proof_text else existing_user.get("proof_text")
             }
-            
             if user_id and not existing_user.get("user_id"):
                 updated_fields["user_id"] = user_id
 
             supabase.table("scammers").update(updated_fields).eq("id", existing_user["id"]).execute()
-
         else:
-            new_user_data = {
+            supabase.table("scammers").insert({
                 "user_id": user_id,
                 "current_username": cleaned_username,
                 "clown_count": clown_inc,
@@ -148,8 +161,26 @@ async def add_or_update_scammer_by_id(
                 "good_count": good_inc,
                 "has_proof": has_proof,
                 "proof_text": proof_text
-            }
-            supabase.table("scammers").insert(new_user_data).execute()
+            }).execute()
 
     except Exception as e:
         print(f"Ошибка Supabase при сохранении/обновлении данных по ID: {e}")
+
+
+# =====================================================================
+# 3. РАБОТА С КЭШЕМ ПОЛЬЗОВАТЕЛЕЙ (ТАБЛИЦА users)
+# =====================================================================
+
+async def get_cached_user_by_username(username: str):
+    """
+    Ищет ID во внутренней OSINT-базе 'users' по юзернейму (Лицо в лицо).
+    """
+    try:
+        cleaned_username = username.lower().replace("@", "").strip()
+        response = supabase.table("users").select("user_id").eq("username", cleaned_username).execute()
+        if response.data:
+            return response.data[0]
+        return None
+    except Exception as e:
+        print(f"Ошибка Supabase при поиске в кэше users: {e}")
+        return None
